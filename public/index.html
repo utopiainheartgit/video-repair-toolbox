@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>视频修复工具</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path fill="currentColor" d="M4 5h11a2 2 0 0 1 2 2v3.2l4-2.6v9.8l-4-2.6V18a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Zm3.5 4.2v6.6l5.4-3.3-5.4-3.3Z"/></svg>
+    <div>
+      <h1>视频修复工具</h1>
+      <p class="sub">先诊断 · 确认清单后再修复 · 健康的文件自动跳过</p>
+    </div>
+  </div>
+  <div class="caps" id="caps"></div>
+</header>
+
+<main>
+  <section id="drop" class="drop" tabindex="0">
+    <div class="drop-inner">
+      <div class="drop-icon">⬇</div>
+      <p class="drop-title">把文件夹或视频文件拖到这里</p>
+      <p class="drop-hint">支持整个文件夹（递归扫描）、单个 / 多选文件，或在下方粘贴多个路径（免上传）</p>
+      <div class="drop-actions">
+        <button type="button" class="btn" id="pickFiles">选择文件</button>
+        <button type="button" class="btn" id="pickFolder">选择文件夹（原生）</button>
+      </div>
+      <div class="paste-box" id="pasteBox">
+        <div class="paste-head">
+          <span class="paste-title">粘贴路径 · 免上传</span>
+          <span class="paste-count" id="pasteCount"></span>
+          <button type="button" class="btn btn-sm btn-ghost" id="pasteClear">清空</button>
+        </div>
+        <textarea id="pathInput" rows="2" spellcheck="false"
+          placeholder="每行一个文件或文件夹路径，可一次粘贴多个&#10;/Users/me/Movies/a.mp4&#10;~/Downloads/视频文件夹&#10;支持带引号路径与 file:// 链接"></textarea>
+        <div class="paste-foot">
+          <span class="paste-hint">路径模式直接在磁盘原地修复，不上传任何字节 · ⌘/Ctrl+Enter 载入</span>
+          <button type="button" class="btn btn-sm btn-primary" id="pathGo" disabled>载入</button>
+        </div>
+        <div class="paste-report" id="pathReport" hidden></div>
+      </div>
+    </div>
+  </section>
+
+  <div id="modeNote" class="note" hidden></div>
+
+  <section class="panel options">
+    <label class="opt">
+      <span class="opt-label">诊断深度</span>
+      <select id="deep">
+        <option value="0">快速（探测 + 结构 + 首尾抽样解码）</option>
+        <option value="1">完整（整片解码，慢但能查出中段损坏）</option>
+      </select>
+    </label>
+    <label class="opt check">
+      <input type="checkbox" id="allowReencode" checked>
+      <span>允许重编码修复<small>无损手段失败时自动重编码，画质可能下降</small></span>
+    </label>
+    <label class="opt">
+      <span class="opt-label">参考文件<small>修 moov 缺失用，需同设备录制的完好视频</small></span>
+      <div class="ref-row">
+        <input type="text" id="refPath" placeholder="未设置（可选）" readonly>
+        <button type="button" class="btn btn-sm" id="pickRef">选择</button>
+        <button type="button" class="btn btn-sm btn-ghost" id="clearRef">清除</button>
+      </div>
+    </label>
+  </section>
+
+  <ol class="steps" id="steps">
+    <li class="step" data-step="1"><span class="step-n">1</span><span class="step-t">诊断</span></li>
+    <li class="step" data-step="2"><span class="step-n">2</span><span class="step-t">确认清单</span></li>
+    <li class="step" data-step="3"><span class="step-n">3</span><span class="step-t">修复</span></li>
+  </ol>
+
+  <section class="actions">
+    <button type="button" class="btn btn-primary" id="btnDiagnose" disabled>开始诊断</button>
+    <button type="button" class="btn btn-ghost" id="btnClear" disabled>清空列表</button>
+    <button type="button" class="btn btn-ghost" id="btnStop" hidden>停止</button>
+    <span class="spacer"></span>
+    <span class="counts" id="counts"></span>
+  </section>
+
+  <section class="panel status" id="statusPanel" hidden>
+    <div class="status-top">
+      <span class="pulse" id="pulse"></span>
+      <strong id="statusTitle">正在启动…</strong>
+      <span class="elapsed">已运行 <b id="elapsed">00:00</b></span>
+      <span class="spacer"></span>
+      <span class="status-counts" id="statusCounts"></span>
+    </div>
+    <div class="status-file">
+      <span class="sf-label">当前文件</span>
+      <span class="sf-name" id="curFile">—</span>
+      <span class="sf-index" id="curIndex"></span>
+    </div>
+    <div class="status-stage">
+      <span id="curStage">准备中…</span>
+      <span class="spacer"></span>
+      <span class="sf-metrics" id="curMetrics"></span>
+    </div>
+    <div class="progress file"><div class="bar" id="fileBar"></div></div>
+    <div class="status-overall">
+      <span class="so-label">总进度</span>
+      <div class="progress"><div class="bar" id="bar"></div></div>
+      <span class="so-text" id="overallText">0 / 0</span>
+    </div>
+  </section>
+
+  <section class="panel failed-panel" id="failedPanel" hidden aria-labelledby="fpTitle">
+    <div class="fp-head">
+      <strong id="fpTitle">修复失败</strong>
+      <span class="fp-sub" id="fpSub">这些文件的原文件均保持不动</span>
+    </div>
+    <div class="fp-list" id="fpList"></div>
+    <div class="fp-foot">
+      <span class="fp-note" id="fpNote"></span>
+      <span class="spacer"></span>
+      <button type="button" class="btn btn-danger" id="fpDelete">删除失败源文件</button>
+    </div>
+  </section>
+
+  <section class="panel repair-list" id="repairPanel" hidden aria-labelledby="rlTitle">
+    <div class="rl-head">
+      <span class="rl-step">第 2 步</span>
+      <div class="rl-title">
+        <strong id="rlTitle">待修复清单</strong>
+        <span class="rl-sub" id="rlSub"></span>
+      </div>
+      <span class="spacer"></span>
+      <div class="rl-tools" id="rlTools">
+        <button type="button" class="btn btn-sm btn-ghost" id="rlAll">全选</button>
+        <button type="button" class="btn btn-sm btn-ghost" id="rlNone">全不选</button>
+      </div>
+    </div>
+    <div class="rl-body" id="rlBody"></div>
+    <div class="rl-clean" id="rlClean" hidden>
+      <span class="rl-clean-icon">✓</span>
+      <div>
+        <strong>全部文件健康，无需修复</strong>
+        <p>没有检测到任何结构或解码问题，原文件不会被改动。</p>
+      </div>
+    </div>
+    <label class="rl-autodel">
+      <input type="checkbox" id="rlAutoDelete">
+      <span>修复失败的源文件自动删除<small>路径模式移入废纸篓（可还原）；拖拽模式受浏览器限制永久删除</small></span>
+    </label>
+    <div class="rl-foot" id="rlFoot">
+      <span class="rl-warn">确认后<strong>直接覆盖原文件</strong>，不保留备份；校验不通过则原文件保持不动。</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn btn-ghost" id="rlCancel">取消</button>
+      <button type="button" class="btn btn-danger" id="rlConfirm">确认修复</button>
+    </div>
+  </section>
+
+  <section class="panel list-panel">
+    <div class="list-head">
+      <span class="c-name">文件</span>
+      <span class="c-size">大小</span>
+      <span class="c-status">状态</span>
+      <span class="c-detail">诊断 / 策略</span>
+    </div>
+    <div id="list" class="list"></div>
+    <div id="empty" class="empty">还没有载入任何文件</div>
+  </section>
+</main>
+
+<div id="toast" class="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>
