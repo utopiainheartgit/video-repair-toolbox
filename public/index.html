@@ -240,9 +240,9 @@
         </select>
       </label>
       <label class="opt opt-full">
-        <span class="opt-label">输出文件<small>留空则存到首个片段旁的 merged/ 目录，重名自动加 -2</small></span>
+        <span class="opt-label">输出文件<small>可填名称或完整路径，不必写后缀；留空则存到源片段所在文件夹，自动命名</small></span>
         <div class="ref-row">
-          <input type="text" id="mOutput" placeholder="自动：merged/首段名_merged.mp4（双击任务标题可逐个改名）" readonly>
+          <input type="text" id="mOutput" placeholder="自动：首段名_merged.mp4" spellcheck="false">
           <button type="button" class="btn btn-sm" id="mPickOutput">另存为</button>
           <button type="button" class="btn btn-sm btn-ghost" id="mClearOutput">清除</button>
         </div>

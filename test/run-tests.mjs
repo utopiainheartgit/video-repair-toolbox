@@ -7,7 +7,7 @@ import { repairInPlace, findUntrunc } from '../lib/repair.mjs';
 import { parseSpsH264, parsePpsH264 } from '../lib/bitstream.mjs';
 import { tryRawStream } from '../lib/rawstream.mjs';
 import { tryHeadFix } from '../lib/headfix.mjs';
-import { probeClip, buildPlan, mergeClips, defaultOutput } from '../lib/merge.mjs';
+import { probeClip, buildPlan, mergeClips, defaultOutput, normalizeOutputName, resolveOutput, isMergeProduct } from '../lib/merge.mjs';
 import { splitTasks, verifyProduct, trashSources } from '../lib/queue.mjs';
 import { moveToTrash, trashDirFor } from '../lib/trash.mjs';
 import { makeSamples } from './samples.mjs';
@@ -202,13 +202,14 @@ async function main() {
     // Once sources go to the trash the name is the only trace left, so these
     // rules are behaviour, not cosmetics.
     const nd = join(DIR, '.naming');
-    await mkdir(join(nd, 'merged'), { recursive: true });
+    await mkdir(nd, { recursive: true });
     const clipA = join(nd, 'GX010001.MP4');
     await copyFile(base, clipA);
 
     const n1 = await defaultOutput(clipA, 'mp4');
-    check('产物落在 merged/ 子目录', n1 === join(nd, 'merged', 'GX010001_merged.mp4'), n1);
+    check('默认产物落在源片段所在文件夹', n1 === join(nd, 'GX010001_merged.mp4'), n1);
     check('单任务不带任务号', !/_t\d\d/.test(n1), n1);
+    check('产物名可被扫描识别', isMergeProduct(n1), n1);
 
     const n2 = await defaultOutput(clipA, 'mp4', { index: 1, total: 3 });
     check('队列任务号两位补零', n2.endsWith('GX010001_merged_t02.mp4'), n2);
@@ -216,6 +217,7 @@ async function main() {
     await writeFile(n2, 'x');
     const n3 = await defaultOutput(clipA, 'mp4', { index: 1, total: 3 });
     check('撞名用短横线序号而非括号', n3.endsWith('GX010001_merged_t02-2.mp4'), n3);
+    check('带撞名序号仍是产物名', isMergeProduct(n3), n3);
 
     check('产物再合并不叠加后缀',
       (await defaultOutput(n3, 'mp4')).endsWith('GX010001_merged.mp4'),
@@ -228,6 +230,22 @@ async function main() {
     const n5 = await defaultOutput(join(nd, `${'长'.repeat(80)}.mp4`), 'mp4');
     check('超长名被截断到安全字节数', Buffer.byteLength(n5.split('/').pop()) <= 200,
       `${Buffer.byteLength(n5.split('/').pop())} 字节`);
+
+    // ---- custom product names ----
+    check('重命名不必写后缀', normalizeOutputName('火辣青春小美', 'mp4') === '火辣青春小美.mp4',
+      normalizeOutputName('火辣青春小美', 'mp4'));
+    check('手写后缀一律被方案后缀覆盖', normalizeOutputName('火辣青春小美.avi', 'mp4') === '火辣青春小美.mp4',
+      normalizeOutputName('火辣青春小美.avi', 'mp4'));
+    check('手写大小写后缀也被覆盖', normalizeOutputName('clip.MOV', 'mkv') === 'clip.mkv',
+      normalizeOutputName('clip.MOV', 'mkv'));
+    check('普通文件名不被误当产物', !isMergeProduct('holiday-2.mp4') && !isMergeProduct('a.mp4'));
+
+    const bare = await resolveOutput('我的合并', clipA, 'mp4');
+    check('裸名落在源文件夹', bare === join(nd, '我的合并.mp4'), bare);
+    const explicit = await resolveOutput('/tmp/explicit.avi', clipA, 'mkv');
+    check('显式绝对路径保留目录并覆盖后缀', explicit === '/tmp/explicit.mkv', explicit);
+    const relative = await resolveOutput('sub/clip.mp4', clipA, 'mp4');
+    check('相对路径相对源文件夹解析', relative === join(nd, 'sub', 'clip.mp4'), relative);
 
     const small = join(DIR, '.merge_small.mp4');
     await run(FFMPEG, ['-y', '-v', 'error',

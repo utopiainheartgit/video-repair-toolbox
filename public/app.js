@@ -957,7 +957,7 @@ render();
 const mstate = {
   clips: [], running: false, abort: null, stopFlag: false,
   plan: null, plans: [], suggested: '', suggestedList: [], lastOutput: '', logs: [],
-  summary: null,
+  summary: null, session: null,
   drag: -1, planTimer: null, planSeq: 0, timer: null,
 };
 
@@ -1009,32 +1009,42 @@ function mAppendFiles(files) {
   return added;
 }
 
-// Products land in `merged/` next to the first clip, so the run never mixes
-// them into the pile of source fragments.
 function mDirOf(p) {
   const i = Math.max(String(p).lastIndexOf('/'), String(p).lastIndexOf('\\'));
   return i > 0 ? String(p).slice(0, i) : '.';
 }
 const mBaseOf = (p) => String(p).split(/[\\/]/).pop() || '';
 
+// Mirrors the server's media-suffix list: a typed extension is never trusted,
+// the merge plan decides the real container. Kept here only so the field shows
+// the same name that will be written; the server always re-normalises.
+const MEDIA_EXT_RE = /\.(?:mp4|m4v|mov|mkv|avi|webm|flv|wmv|mpg|mpeg|m2ts|mts|ts|3gp|3g2|ogv|ogm|vob|rm|rmvb|asf|divx|f4v|hevc|h264|aac|mp3|m4a|flac|wav|ogg)$/i;
+function mNormOutName(raw, ext) {
+  let s = String(raw || '').trim().replace(MEDIA_EXT_RE, '');
+  const dot = s.startsWith('.') ? '.' : '';
+  const chars = [...s];
+  s = (chars.length > 60 ? chars.slice(0, 60).join('') : s)
+    .replace(/[\u0000-\u001f\u007f]/g, '').replace(/[/\\:*?"<>|]/g, '_')
+    .replace(/\s+/g, ' ').replace(/^[\s.]+|[\s.]+$/g, '').replace(/[\s.\-_]+$/g, '');
+  return `${dot}${s || 'video'}.${ext || 'mp4'}`;
+}
+
 // A per-task name override rides on the group's first clip (`outName`), so it
 // survives splitting and reordering without a parallel array to keep in sync.
-// A bare filename goes into `merged/`; anything with a slash is relative to the
-// first clip's directory; an absolute path wins outright.
+// The value is passed through verbatim — the server's resolveOutput() decides
+// the folder (bare name → first clip's own folder) and always applies the
+// plan's extension. Never pre-build a path or keep a typed suffix here.
 function mTaskOutput(group) {
   const s = String(group[0]?.outName || '').trim();
-  if (!s) return null;
-  if (s.startsWith('/') || /^[A-Za-z]:[\\/]/.test(s)) return s;
-  const dir = mDirOf(group[0].path);
-  return s.includes('/') ? `${dir}/${s}` : `${dir}/merged/${s}`;
+  return s || null;
 }
 
 // A task boundary lives on the clip before it (`breakAfter`), so reordering and
 // removal keep groups coherent without a second array to keep in sync.
-function mSplitTasks() {
+function mSplitTasks(source = mstate.clips) {
   const tasks = [];
   let cur = [];
-  const clips = mstate.clips;
+  const clips = source;
   for (let i = 0; i < clips.length; i++) {
     cur.push(clips[i]);
     if (clips[i].breakAfter || i === clips.length - 1) {
@@ -1107,21 +1117,31 @@ function mRender() {
       // going to the trash, this name is the only trace left, so it has to be
       // visible (and fixable) while there is still time.
       const shownName = custom || (auto ? mBaseOf(auto) : '');
+      const outPlaceholder = auto ? `默认 ${mBaseOf(auto)}` : '自动命名';
       head.innerHTML = `<span class="mtask-no">任务 ${gi + 1}</span>`
         + `<span class="mtask-meta">${group.length} 段${dur ? ` · ${fmtDur(dur)}` : ''}</span>`
-        + `<span class="mtask-out${custom ? ' custom' : ''}" title="产物存到首个片段旁的 merged/ 目录，双击可改名">`
-        + `${esc(shownName || '…')}</span>`
+        + `<input type="text" class="mtask-out${custom ? ' custom' : ''}" spellcheck="false" `
+        + `value="${esc(custom)}" placeholder="${esc(outPlaceholder)}" `
+        + `title="产物文件名：可填名称或路径，留空用默认。默认存到首个片段所在文件夹">`
         + '<span class="mtask-line"></span>'
         + (gi > 0 ? '<button type="button" class="mtask-join" title="把本任务并回上一个任务">并回上一任务</button>' : '');
+      // Editable output name. Use `change` (fires on blur / Enter) instead of
+      // `input`, and never re-render on each keystroke — that would destroy the
+      // field mid-typing and lose focus. Normalise on commit only.
       const outEl = head.querySelector('.mtask-out');
-      outEl.ondblclick = () => {
-        const cur = custom || shownName;
-        const next = prompt(`任务 ${gi + 1} 的产物文件名（留空恢复自动命名）`, cur);
-        if (next === null) return;
-        const v = next.trim();
-        group[0].outName = v ? (/\.\w{2,5}$/.test(v) ? v : `${v}.${mstate.plans?.[gi]?.outExt || 'mp4'}`) : '';
-        mRender();
+      outEl.onchange = () => {
+        const v = outEl.value.trim();
+        // A bare name is normalised for display; a path (absolute or relative)
+        // is passed through so the server can resolve it. Either way the final
+        // extension is the plan's — a typed suffix is never kept.
+        if (!v) group[0].outName = '';
+        else if (v.includes('/') || v.includes('\\')) group[0].outName = v;
+        else group[0].outName = mNormOutName(v, mstate.plans?.[gi]?.outExt || 'mp4');
+        outEl.value = group[0].outName;
+        outEl.classList.toggle('custom', !!group[0].outName);
+        outEl.placeholder = group[0].outName ? outPlaceholder : (auto ? `默认 ${mBaseOf(auto)}` : '自动命名');
       };
+      outEl.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); outEl.blur(); } };
       const join = head.querySelector('.mtask-join');
       if (join) {
         // Capture the boundary now: `idx` is a loop variable and reading it
@@ -1186,7 +1206,7 @@ function mUpdateMergeMeta() {
   // A single output path cannot describe several products, so multi-task runs
   // always auto-name beside each task's first clip.
   $('mOutput').disabled = multi || mstate.running;
-  $('mOutput').title = multi ? '多任务时各自存到首个片段旁的 merged/ 目录，双击任务标题可改名' : '';
+  $('mOutput').title = multi ? '多任务时在每个任务头里单独填写产物名，留空用默认' : '留空自动命名，可填名称或完整路径';
   $('mPickOutput').disabled = multi || mstate.running;
   $('mClearOutput').disabled = multi || mstate.running;
 }
@@ -1243,8 +1263,8 @@ async function mRefreshPlan() {
         mstate.suggested = d.suggestedOutput || '';
         if (!$('mOutput').value) {
           $('mOutput').placeholder = d.suggestedOutput
-            ? `自动：merged/${mBaseOf(d.suggestedOutput)}`
-            : '自动：首个片段旁的 merged/ 目录';
+            ? `自动：${mBaseOf(d.suggestedOutput)}`
+            : '自动：首个片段所在文件夹';
         }
       }
     }
@@ -1315,7 +1335,8 @@ function mSetRunning(on) {
   $('mStop').hidden = !on;
   $('mMode').disabled = on; $('mSize').disabled = on; $('mQuality').disabled = on;
   $('mDeleteSources').disabled = on;
-  $('mPathGo').disabled = on || !parsePaths($('mPathInput').value).length;
+  // Intake stays live while running: clips added mid-run become the next batch.
+  $('mPathGo').disabled = !parsePaths($('mPathInput').value).length;
   mUpdateMergeMeta();
   mRender();
 }
@@ -1397,23 +1418,41 @@ function showQueueResult(sum) {
   box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
+// Validate a task list before sending it. `checkPlan` is only used for the
+// first batch; mid-run additions may still be waiting for their analysis.
+function mValidateTasks(tasks, checkPlan = false) {
+  if (!tasks.length) return { ok: false, error: '没有任务' };
+  const badIdx = tasks.findIndex((t) => t.length < 2);
+  if (badIdx >= 0) return { ok: false, error: `任务 ${badIdx + 1} 只有 1 段，请先并回相邻任务或补充片段` };
+  const usable = tasks.map((t) => t.filter((c) => !c.error));
+  if (usable.some((t) => t.length < 2)) return { ok: false, error: '有任务的可用片段不足 2 个，请先移除无法解析的文件' };
+  if (checkPlan) {
+    const badPlan = (mstate.plans || []).find((p) => p && !p.ok);
+    if (badPlan) return { ok: false, error: badPlan.reasons?.[0] || '有任务在当前设置下无法合并' };
+  }
+  return { ok: true };
+}
+
+// Combine all batch summaries into one result card with global task numbering.
+function mSummarizeSummaries(list) {
+  const out = {
+    total: 0, succeeded: 0, partial: 0, failed: 0, notRun: 0,
+    deletedCount: 0, keptCount: 0, trashErrorCount: 0, tasks: [], deleteSources: false,
+  };
+  for (const s of list) {
+    for (const k of ['total', 'succeeded', 'partial', 'failed', 'notRun', 'deletedCount', 'keptCount', 'trashErrorCount']) out[k] += s[k] || 0;
+    out.deleteSources = out.deleteSources || !!s.deleteSources;
+    for (const t of (s.tasks || [])) out.tasks.push({ ...t, index: out.tasks.length });
+  }
+  if (!list.length) out.deleteSources = !!$('mDeleteSources')?.checked;
+  return out;
+}
+
 async function mStart() {
   if (mstate.running) return;
   const tasks = mSplitTasks();
-  if (!tasks.length) return;
-
-  const badIdx = tasks.findIndex((t) => t.length < 2);
-  if (badIdx >= 0) {
-    toast(`任务 ${badIdx + 1} 只有 1 段，请先并回相邻任务或补充片段`, 'bad');
-    return;
-  }
-  const usable = tasks.map((t) => t.filter((c) => !c.error));
-  if (usable.some((t) => t.length < 2)) {
-    toast('有任务的可用片段不足 2 个，请先移除无法解析的文件', 'bad');
-    return;
-  }
-  const badPlan = (mstate.plans || []).find((p) => p && !p.ok);
-  if (badPlan) { toast(badPlan.reasons?.[0] || '有任务在当前设置下无法合并', 'bad'); return; }
+  const v = mValidateTasks(tasks, true);
+  if (!v.ok) { toast(v.error, 'bad'); return; }
 
   const single = tasks.length === 1;
   const doDelete = $('mDeleteSources').checked;
@@ -1421,7 +1460,7 @@ async function mStart() {
   // server, so a hand-picked location was silently ignored. Send it now.
   const manual = single ? $('mOutput').value.trim() : '';
   const totalDur = mstate.clips.reduce((s, c) => s + (c.dur || 0), 0);
-  const skipCount = mstate.clips.length - usable.flat().length;
+  const skipCount = mstate.clips.filter((c) => c.error).length;
 
   const p = mstate.plans?.[0];
   const strat = p?.ok
@@ -1438,9 +1477,12 @@ async function mStart() {
         { label: '片段', value: String(mstate.clips.length) },
         { label: '预计时长', value: fmtDur(totalDur) || '—' },
       ];
+  const manualShown = manual
+    ? (manual.includes('/') || manual.includes('\\') ? manual : mNormOutName(manual, p?.outExt || 'mp4'))
+    : '';
   const rows = single
-    ? [{ label: '输出文件', value: manual || mstate.suggested || '首个片段旁的 merged/ 目录（自动命名）' }]
-    : [{ label: '输出文件', value: '各自存到该任务首个片段旁的 merged/ 目录，命名如 <首段名>_merged_t01.mp4' }];
+    ? [{ label: '输出文件', value: manualShown || mstate.suggested || '首个片段所在文件夹（自动命名）' }]
+    : [{ label: '输出文件', value: '各自存到该任务首个片段所在文件夹，命名如 <首段名>_merged_t01.mp4' }];
   const warn = doDelete
     ? (skipCount
         ? `合并成功后将把源文件移入废纸篓（可还原）。仅零告警且校验通过的任务会删，否则整组保留。<br>注意：有 <b>${skipCount}</b> 个片段无法解析，所在任务会整组保留源文件。`
@@ -1458,16 +1500,42 @@ async function mStart() {
   });
   if (!ok) return;
 
+  // A session can span several batches: clips added while one batch is running
+  // are picked up as a new batch when it finishes. Settings are snapshotted so
+  // a mid-run batch uses exactly the same options as the first one.
+  mstate.session = {
+    opts: { mode: $('mMode').value, size: $('mSize').value, quality: $('mQuality').value, doDelete },
+    manual,
+    summaries: [],
+    donePaths: new Set(),
+    batchNo: 0,
+    t0: Date.now(),
+  };
   mstate.stopFlag = false;
   mstate.logs = [];
   mstate.summary = null;
   $('mResult').hidden = true;
   $('mTaskList').hidden = true;
+  mSetRunning(true);
+  await mRunBatch(tasks);
+}
+
+// Run one batch over SSE. On completion, any clips added mid-run (paths not yet
+// submitted) become the next batch automatically. Stops never spawn a new batch.
+async function mRunBatch(tasks) {
+  const s = mstate.session;
+  s.batchNo += 1;
+  const batchNo = s.batchNo;
+  const single = tasks.length === 1;
+  const doDelete = s.opts.doDelete;
+  for (const t of tasks) for (const c of t) s.donePaths.add(c.path);
+
   const panel = $('mStatusPanel');
   panel.hidden = false;
   panel.classList.remove('done', 'warn', 'bad');
-  $('mStatusTitle').textContent = single ? '正在合并' : `正在合并任务 1 / ${tasks.length}`;
-  $('mStatusCounts').textContent = single ? `${mstate.clips.length} 个片段` : `0 / ${tasks.length} 个任务`;
+  const tag = s.summaries.length ? `第 ${batchNo} 批 · ` : '';
+  $('mStatusTitle').textContent = single ? `正在合并${tag}` : `正在合并${tag}任务 1 / ${tasks.length}`;
+  $('mStatusCounts').textContent = single ? `${tasks[0].length} 个片段` : `0 / ${tasks.length} 个任务`;
   $('mCurClip').textContent = '准备中…';
   $('mCurIndex').textContent = '';
   $('mCurStage').textContent = '分析片段…';
@@ -1476,11 +1544,9 @@ async function mStart() {
   $('mBar').style.width = '';
   $('mBarTotal').style.width = '0%';
   $('mPercent').textContent = '0%';
-  $('mElapsed').textContent = '00:00';
-  const t0 = Date.now();
+  $('mElapsed').textContent = fmtClock(Date.now() - s.t0);
   clearInterval(mstate.timer);
-  mstate.timer = setInterval(() => { $('mElapsed').textContent = fmtClock(Date.now() - t0); }, 500);
-  mSetRunning(true);
+  mstate.timer = setInterval(() => { $('mElapsed').textContent = fmtClock(Date.now() - s.t0); }, 500);
   panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 
   const ctrl = new AbortController();
@@ -1493,11 +1559,11 @@ async function mStart() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         tasks: tasks.map((t, i) => {
-          const output = (manual && i === 0) ? manual : mTaskOutput(t);
+          const output = (s.manual && batchNo === 1 && i === 0) ? s.manual : mTaskOutput(t);
           const files = t.map((c) => c.path);
           return output ? { files, output } : { files };
         }),
-        mode: $('mMode').value, size: $('mSize').value, quality: $('mQuality').value,
+        mode: s.opts.mode, size: s.opts.size, quality: s.opts.quality,
         deleteSources: doDelete,
       }),
     });
@@ -1506,7 +1572,7 @@ async function mStart() {
       if (ev === 'queue-start') {
         $('mCurStage').textContent = `共 ${d.total} 个任务，准备中…`;
       } else if (ev === 'task-start') {
-        $('mStatusTitle').textContent = `正在合并任务 ${d.index + 1} / ${d.total}`;
+        $('mStatusTitle').textContent = `${tag}正在合并任务 ${d.index + 1} / ${d.total}`;
         $('mStatusCounts').textContent = `${doneTasks} / ${d.total} 个任务已完成`;
         $('mCurClip').textContent = d.names?.[0] || '—';
         $('mCurIndex').textContent = `1 / ${d.names?.length || 0}`;
@@ -1557,38 +1623,72 @@ async function mStart() {
     });
   } catch (e) {
     if (e.name !== 'AbortError') toast(`合并出错：${e}`, 'bad');
-  } finally {
-    clearInterval(mstate.timer);
-    mstate.timer = null;
-    mstate.abort = null;
-    mSetRunning(false);
-    $('mBar').classList.remove('indeterminate');
-    $('mElapsed').textContent = fmtClock(Date.now() - t0);
-
-    if (summary) {
-      mstate.summary = summary;
-      const clean = summary.failed === 0 && summary.partial === 0 && summary.notRun === 0;
-      $('mBar').style.width = '100%';
-      $('mBarTotal').style.width = '100%';
-      $('mPercent').textContent = '100%';
-      panel.classList.add(clean ? 'done' : 'warn');
-      $('mStatusTitle').textContent = clean ? '队列完成' : '队列完成（部分需处理）';
-      $('mCurStage').textContent = '全部任务已跑完';
-      $('mCurMetrics').textContent = '';
-      const firstOut = (summary.tasks || []).find((t) => t.output);
-      if (firstOut) mstate.lastOutput = firstOut.output;
-      showQueueResult(summary);
-      const tail = summary.deletedCount ? ` · 已移入废纸篓 ${summary.deletedCount} 个源文件` : '';
-      toast(`${summary.succeeded} 成功${summary.failed ? ` / ${summary.failed} 失败` : ''}${tail}`, clean ? 'ok' : 'bad');
-    } else {
-      const stopped = mstate.stopFlag;
-      panel.classList.add(stopped ? 'warn' : 'bad');
-      $('mStatusTitle').textContent = stopped ? '已停止' : '队列异常中断';
-      $('mCurStage').textContent = stopped ? '已停止，未完成的任务不会留下半成品' : '未拿到队列结果，请查看日志';
-      toast(stopped ? '已停止' : '队列异常中断', 'bad');
-    }
-    mRender();
   }
+
+  // Per-batch teardown. Keep the session alive; only the whole session sets
+  // running=false (in mFinishRun).
+  clearInterval(mstate.timer);
+  mstate.timer = null;
+  mstate.abort = null;
+  $('mBar').classList.remove('indeterminate');
+  $('mElapsed').textContent = fmtClock(Date.now() - s.t0);
+
+  if (summary) {
+    s.summaries.push(summary);
+    // Sources moved to the trash have dead paths: drop them from the work list.
+    const gone = new Set(summary.tasks.flatMap((t) => t.deleted || []));
+    if (gone.size) mstate.clips = mstate.clips.filter((c) => !gone.has(c.path));
+  }
+
+  if (mstate.stopFlag) { mFinishRun(true); return; }
+
+  // Clips added mid-run: any path not yet submitted and still parseable.
+  const pending = mstate.clips.filter((c) => !s.donePaths.has(c.path) && !c.error);
+  if (pending.length >= 2) {
+    const nextTasks = mSplitTasks(pending);
+    if (mValidateTasks(nextTasks).ok) {
+      toast(`发现 ${pending.length} 个新片段，自动开始第 ${batchNo + 1} 批`, 'ok');
+      mRender();
+      await mRunBatch(nextTasks);
+      return;
+    }
+  }
+  mFinishRun(false, pending.length);
+}
+
+// Finalise the whole session: combine every batch into one result card.
+function mFinishRun(stopped, leftover = 0) {
+  const s = mstate.session;
+  mSetRunning(false);
+  const panel = $('mStatusPanel');
+  const combined = mSummarizeSummaries(s.summaries);
+
+  if (combined.tasks.length) {
+    mstate.summary = combined;
+    const clean = !stopped && combined.failed === 0 && combined.partial === 0 && combined.notRun === 0;
+    $('mBar').style.width = '100%';
+    $('mBarTotal').style.width = '100%';
+    $('mPercent').textContent = '100%';
+    panel.classList.add(stopped ? 'warn' : clean ? 'done' : 'warn');
+    $('mStatusTitle').textContent = stopped ? '已停止' : clean ? '队列完成' : '队列完成（部分需处理）';
+    $('mCurStage').textContent = stopped
+      ? '已停止，当前批次未完成的任务不会留下半成品'
+      : (s.summaries.length > 1 ? `共 ${s.summaries.length} 批全部跑完` : '全部任务已跑完');
+    $('mCurMetrics').textContent = '';
+    const firstOut = combined.tasks.find((t) => t.output);
+    if (firstOut) mstate.lastOutput = firstOut.output;
+    showQueueResult(combined);
+    const tail = combined.deletedCount ? ` · 已移入废纸篓 ${combined.deletedCount} 个源文件` : '';
+    toast(`${combined.succeeded} 成功${combined.failed ? ` / ${combined.failed} 失败` : ''}${tail}`, clean ? 'ok' : 'bad');
+  } else {
+    panel.classList.add(stopped ? 'warn' : 'bad');
+    $('mStatusTitle').textContent = stopped ? '已停止' : '队列异常中断';
+    $('mCurStage').textContent = stopped ? '已停止，未完成的任务不会留下半成品' : '未拿到队列结果，请查看日志';
+    toast(stopped ? '已停止' : '队列异常中断', 'bad');
+  }
+  if (!stopped && leftover === 1) toast('有 1 个新增片段不足 2 个，未自动合并', '');
+  mstate.session = null;
+  mRender();
 }
 
 

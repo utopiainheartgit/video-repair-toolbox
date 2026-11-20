@@ -110,18 +110,20 @@ const manyPaths = many.results.flatMap((r) => (r.files || []).map((f) => f.path)
 check('聚合文件列表内无重复路径', new Set(manyPaths).size === manyPaths.length, `${manyPaths.length} items`);
 check('duplicates 只计真实重复，不含失效路径', many.duplicates === 1, `duplicates=${many.duplicates}`);
 
-// Products sit in `<source>/merged/`; a re-scan must not pull them back in and
-// feed a merge its own output.
+// Products now sit BESIDE their sources; a re-scan must skip them by the strict
+// `_merged[_tNN][-N].ext` name and not feed a merge its own output.
 const srcDir = join(DIR, '.scan-merged');
-await mkdir(join(srcDir, 'merged'), { recursive: true });
+await mkdir(srcDir, { recursive: true });
 await writeFile(join(srcDir, 'a.mp4'), 'x');
-await writeFile(join(srcDir, 'merged', 'a_merged.mp4'), 'x');
+await writeFile(join(srcDir, 'a_merged.mp4'), 'x');
+await writeFile(join(srcDir, 'a_merged_t02.mp4'), 'x');
+await writeFile(join(srcDir, 'holiday-2.mp4'), 'x');
 const sm = await (await fetch(BASE + '/api/scan-many', {
   method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths: [srcDir] }),
 })).json();
 const smFiles = (sm.results?.[0]?.files || []).map((f) => f.name);
-check('扫描跳过 merged/ 产物目录', !smFiles.includes('a_merged.mp4'), smFiles.join(','));
-check('扫描仍收录同级源片段', smFiles.includes('a.mp4'), smFiles.join(','));
+check('扫描跳过同级合并产物', !smFiles.includes('a_merged.mp4') && !smFiles.includes('a_merged_t02.mp4'), smFiles.join(','));
+check('扫描仍收录普通源片段', smFiles.includes('a.mp4') && smFiles.includes('holiday-2.mp4'), smFiles.join(','));
 await rm(srcDir, { recursive: true, force: true }).catch(() => {});
 
 console.log('\n=== 非法路径与 file:// 归一化 ===');
@@ -209,7 +211,9 @@ check('队列汇总统计正确', qDone?.d.succeeded === 1 && qDone?.d.failed ==
 check('队列产物已生成', !!(await stat(qTask?.d.output).catch(() => null)));
 check('任务回报删除失败明细字段', Array.isArray(qTask?.d.trashErrors));
 check('汇总含删除失败计数', typeof qDone?.d.trashErrorCount === 'number' && qDone.d.trashErrorCount === 0);
-check('产物落在 merged/ 子目录', String(qTask?.d.output || '').includes('/merged/'), qTask?.d.output);
+check('产物落在源片段所在文件夹（无 merged/ 子目录）',
+  !String(qTask?.d.output || '').includes('/merged/') && String(qTask?.d.output || '').includes('/testdata/'),
+  qTask?.d.output);
 check('单任务产物不带任务号', /api_merge_a_merged\.mp4$/.test(qTask?.d.output || ''), qTask?.d.output);
 
 // A per-task path must be honoured — the UI sends one for a single task and
@@ -219,6 +223,16 @@ const manEvts = await sse('/api/merge-queue', { tasks: [{ files: [ma, mb], outpu
 const manDone = manEvts.find((e) => e.ev === 'task-done');
 check('队列采用逐任务指定的输出路径', manDone?.d.output === manualOut, manDone?.d.output);
 check('指定路径的产物已生成', !!(await stat(manualOut).catch(() => null)));
+
+// A bare rename with no suffix must land beside the sources with the plan's
+// extension appended (the exact bug behind the 火辣青春小美 log entry).
+const bareEvts = await sse('/api/merge-queue', {
+  tasks: [{ files: [ma, mb], output: '裸名测试产物' }], mode: 'auto',
+});
+const bareDone = bareEvts.find((e) => e.ev === 'task-done');
+const bareOut = join(DIR, '裸名测试产物.mp4');
+check('裸名重命名落到源文件夹并自动补后缀', bareDone?.d.output === bareOut, bareDone?.d.output);
+check('裸名重命名的产物已生成', !!(await stat(bareOut).catch(() => null)));
 
 const badFile = join(DIR, '.api_qbad.mp4');
 await writeFile(badFile, 'not a video');
@@ -241,6 +255,7 @@ check('多任务产物带补零任务号', /_merged_t02\.mp4$/.test(seqDone?.d.t
 
 await rm(badFile, { force: true }).catch(() => {});
 await rm(manualOut, { force: true }).catch(() => {});
+await rm(bareOut, { force: true }).catch(() => {});
 await rm(join(DIR, 'merged'), { recursive: true, force: true }).catch(() => {});
 
 for (const f of [ma, mb, join(DIR, '.api_merged.mp4')]) await rm(f, { force: true }).catch(() => {});

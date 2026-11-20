@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { isVideoFile, diagnose, FFMPEG, FFPROBE, run } from './lib/probe.mjs';
 import { repairFile, repairInPlace, findUntrunc, cleanupWork } from './lib/repair.mjs';
-import { probeClip, buildPlan, mergeClips, defaultOutput, OUTPUT_DIR } from './lib/merge.mjs';
+import { probeClip, buildPlan, mergeClips, defaultOutput, resolveOutput, isMergeProduct } from './lib/merge.mjs';
 import { verifyProduct, trashSources } from './lib/queue.mjs';
 import { moveToTrash as trashFile } from './lib/trash.mjs';
 import { appendJobLog, LOG_FILE } from './lib/joblog.mjs';
@@ -102,10 +102,12 @@ async function scanDir(root, { maxFiles = 20000 } = {}) {
       if (e.name.startsWith('.')) continue;
       const p = join(dir, e.name);
       if (e.isSymbolicLink()) continue;
-      // Products live in `<source>/merged/`. Scanning them back in would let a
-      // re-scan merge a product with the very fragments it was built from.
-      if (e.isDirectory()) { if (e.name !== OUTPUT_DIR) stack.push(p); }
-      else if (e.isFile() && isVideoFile(e.name)) {
+      // Products now sit beside their sources. Skip any generated product by
+      // its strict `_merged[_tNN][-N].<ext>` name, plus the legacy `merged/`
+      // folder from earlier versions — otherwise a re-scan could merge a
+      // product back with the very fragments it was built from.
+      if (e.isDirectory()) { if (e.name !== 'merged') stack.push(p); }
+      else if (e.isFile() && isVideoFile(e.name) && !isMergeProduct(e.name)) {
         const s = await stat(p).catch(() => null);
         if (s) out.push({ path: p, name: e.name, size: s.size, rel: p.slice(root.length).replace(/^\//, '') });
       }
@@ -572,10 +574,15 @@ async function handleApi(req, res, url) {
       } else if (result.aborted) {
         verify = { ok: false, reason: '已停止' };
         kept = t.files.slice();
-      } else if (skipped > 0) {
-        // Some source never made it into the product, so deleting the rest
-        // would silently lose footage. Keep the whole task.
-        verify = { ok: false, reason: `有 ${skipped} 个片段无法解析、未参与合并，整组保留源文件` };
+      } else if (skipped > 0 || (result.skippedMidRun || []).length > 0) {
+        // Some source never made it into the product (unparseable at probe time
+        // or vanished mid-run), so deleting the rest would silently lose
+        // footage. Keep the whole task.
+        const gone = (result.skippedMidRun || []).length;
+        const parts = [];
+        if (skipped > 0) parts.push(`${skipped} 个片段无法解析`);
+        if (gone > 0) parts.push(`${gone} 个片段在合并中消失`);
+        verify = { ok: false, reason: `有 ${parts.join('、')}、未参与合并，整组保留源文件` };
         kept = t.files.slice();
       } else {
         verify = await verifyProduct(result, usable);
@@ -613,6 +620,7 @@ async function handleApi(req, res, url) {
         reasons: result?.reasons || [],
         warnings: result?.warnings || [],
         skipped,
+        skippedMidRun: result?.skippedMidRun || [],
         aborted: !!result?.aborted,
       };
 
