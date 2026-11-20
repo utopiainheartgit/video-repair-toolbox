@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFile, stat, readdir } from 'node:fs/promises';
+import { readFile, stat, readdir, writeFile, rm, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { makeSamples } from './samples.mjs';
 
@@ -82,6 +82,168 @@ for (const n of ['corrupt.mp4', 'noindex.avi', 'truncated.mp4']) {
   check(`${n} 替换后大小 > 0`, (await stat(p)).size > 0);
 }
 check('没有遗留 .repairing 临时文件', !(await readdir(DIR)).some((f) => f.endsWith('.repairing')));
+
+console.log('\n=== 能力探测：统一路径模式 ===');
+const caps = await (await fetch(BASE + '/api/capabilities')).json();
+check('handleMode 已关闭（不上传文件字节）', caps.handleMode === false);
+check('pathMode 已开启', caps.pathMode === true);
+
+console.log('\n=== 批量扫描 /api/scan-many ===');
+const goodFile = join(DIR, 'healthy.mp4');
+const manyBody = {
+  paths: [
+    DIR,                 // folder → several files
+    goodFile,            // single file, also inside DIR → should dedupe
+    goodFile,            // exact duplicate path → reported as duplicate
+    join(DIR, 'no-such-file.mp4'), // missing → ok:false
+  ],
+};
+const many = await (await fetch(BASE + '/api/scan-many', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(manyBody),
+})).json();
+check('批量扫描返回逐项结果', Array.isArray(many.results) && many.results.length === manyBody.paths.length);
+check('文件夹项扫描成功且有文件', many.results[0]?.ok === true && many.results[0].count > 0);
+check('单文件项扫描成功', many.results[1]?.ok === true && many.results[1].kind === 'file');
+check('重复路径被识别', many.duplicates >= 1, `duplicates=${many.duplicates}`);
+check('失效路径返回 ok:false', many.results[3]?.ok === false);
+const manyPaths = many.results.flatMap((r) => (r.files || []).map((f) => f.path));
+check('聚合文件列表内无重复路径', new Set(manyPaths).size === manyPaths.length, `${manyPaths.length} items`);
+check('duplicates 只计真实重复，不含失效路径', many.duplicates === 1, `duplicates=${many.duplicates}`);
+
+// Products sit in `<source>/merged/`; a re-scan must not pull them back in and
+// feed a merge its own output.
+const srcDir = join(DIR, '.scan-merged');
+await mkdir(join(srcDir, 'merged'), { recursive: true });
+await writeFile(join(srcDir, 'a.mp4'), 'x');
+await writeFile(join(srcDir, 'merged', 'a_merged.mp4'), 'x');
+const sm = await (await fetch(BASE + '/api/scan-many', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths: [srcDir] }),
+})).json();
+const smFiles = (sm.results?.[0]?.files || []).map((f) => f.name);
+check('扫描跳过 merged/ 产物目录', !smFiles.includes('a_merged.mp4'), smFiles.join(','));
+check('扫描仍收录同级源片段', smFiles.includes('a.mp4'), smFiles.join(','));
+await rm(srcDir, { recursive: true, force: true }).catch(() => {});
+
+console.log('\n=== 非法路径与 file:// 归一化 ===');
+const weird = await (await fetch(BASE + '/api/scan-many', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ paths: ['', '   ', 123, null, 'file://' + goodFile] }),
+})).json();
+check('空串/非字符串被标为 invalid', weird.invalid === 4, `invalid=${weird.invalid}`);
+check('file:// 路径被归一化为真实文件', weird.results[4]?.ok === true && weird.results[4]?.kind === 'file');
+
+console.log('\n=== 续跑偏移 resumeFrom ===');
+// One healthy file only. With resumeFrom=7 the stream's total must start at 8.
+const re2 = await sse('/api/jobs', { mode: 'diagnose', files: [goodFile], deep: false, resumeFrom: 7 });
+const startEvt = re2.find((e) => e.ev === 'start');
+const doneEvt = re2.find((e) => e.ev === 'done');
+check('start.total 计入续跑偏移', startEvt?.d.total === 8, JSON.stringify(startEvt?.d));
+check('done.total 计入续跑偏移', doneEvt?.d.total === 8, JSON.stringify(doneEvt?.d));
+check('续跑仍正常处理该文件', re2.filter((e) => e.ev === 'file-done').length === 1);
+const progEvts = re2.filter((e) => e.ev === 'progress');
+check('progress.total 与 start/done.total 一致', progEvts.length > 0 && progEvts.every((e) => e.d.total === 8), JSON.stringify(progEvts.map((e) => e.d)));
+
+console.log('\n=== 合并：计划接口 ===');
+const { copyFile } = await import('node:fs/promises');
+const ma = join(DIR, '.api_merge_a.mp4');
+const mb = join(DIR, '.api_merge_b.mp4');
+await copyFile(goodFile, ma);
+await copyFile(goodFile, mb);
+
+const planRes = await fetch(BASE + '/api/merge-plan', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ files: [ma, mb], mode: 'auto', size: 'first', quality: 'balanced' }),
+});
+const planBody = await planRes.json();
+check('merge-plan 返回 200', planRes.status === 200, String(planRes.status));
+check('merge-plan 探测出两段', planBody.clips?.length === 2 && planBody.clips.every((c) => c.ok));
+check('同规格判定为无损 copy', planBody.plan?.strategy === 'copy', planBody.plan?.strategy);
+check('给出自动输出名', !!planBody.suggestedOutput && planBody.suggestedOutput.includes('_merged'), planBody.suggestedOutput);
+check('merge-plan 未生成任何文件', !(await stat(planBody.suggestedOutput).catch(() => null)));
+
+const badPlan = await (await fetch(BASE + '/api/merge-plan', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ files: [], mode: 'auto' }),
+})).json();
+check('merge-plan 空列表返回 400 语义', !badPlan.clips && !!badPlan.error);
+
+console.log('\n=== 合并：执行接口 ===');
+const mergeEvts = await sse('/api/merge', { files: [ma, mb], mode: 'auto', output: join(DIR, '.api_merged.mp4') });
+const mDone = mergeEvts.find((e) => e.ev === 'merge-done');
+check('merge 产生 merge-done', !!mDone);
+check('合并成功', mDone?.d.ok === true, (mDone?.d.reasons || []).join('；'));
+check('策略为无损 copy', mDone?.d.strategy === 'copy', mDone?.d.strategy);
+check('时长≈24s', mDone?.d.duration > 23 && mDone?.d.duration < 25, `dur=${mDone?.d.duration}`);
+check('含 clips 明细', Array.isArray(mDone?.d.clips) && mDone.d.clips.length === 2);
+check('源片段哈希未变', (await sha(ma)) === (await sha(goodFile)));
+
+const guardEvts = await sse('/api/merge', { files: [ma, mb], output: ma.toUpperCase() });
+const gDone = guardEvts.find((e) => e.ev === 'merge-done');
+check('输出指向输入时拒绝', gDone?.d.ok === false, JSON.stringify(gDone?.d));
+
+let shortRejected = false;
+try { await sse('/api/merge', { files: [ma] }); } catch { shortRejected = true; }
+check('少于 2 段被拒绝', shortRejected);
+
+const reveal = await (await fetch(BASE + '/api/reveal', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: '/no/such/file.mp4' }),
+})).json();
+check('reveal 对不存在的路径返回错误', !!reveal.error);
+
+console.log('\n=== 合并队列 ===');
+const post = (path, body) => fetch(BASE + path, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+});
+check('空队列返回 400', (await post('/api/merge-queue', { tasks: [] })).status === 400);
+check('单片段任务返回 400', (await post('/api/merge-queue', { tasks: [{ files: [ma] }] })).status === 400);
+
+const qEvts = await sse('/api/merge-queue', { tasks: [{ files: [ma, mb] }], mode: 'auto', deleteSources: false });
+const qStart = qEvts.find((e) => e.ev === 'queue-start');
+const qTask = qEvts.find((e) => e.ev === 'task-done');
+const qDone = qEvts.find((e) => e.ev === 'queue-done');
+check('队列发出 queue-start', qStart?.d.total === 1, JSON.stringify(qStart?.d));
+check('队列任务合并成功', qTask?.d.ok === true, (qTask?.d.reasons || []).join('；'));
+check('未开启删除时不删源', qTask?.d.deleted.length === 0);
+check('队列汇总统计正确', qDone?.d.succeeded === 1 && qDone?.d.failed === 0 && qDone?.d.deletedCount === 0,
+  JSON.stringify(qDone?.d && { s: qDone.d.succeeded, f: qDone.d.failed, d: qDone.d.deletedCount }));
+check('队列产物已生成', !!(await stat(qTask?.d.output).catch(() => null)));
+check('任务回报删除失败明细字段', Array.isArray(qTask?.d.trashErrors));
+check('汇总含删除失败计数', typeof qDone?.d.trashErrorCount === 'number' && qDone.d.trashErrorCount === 0);
+check('产物落在 merged/ 子目录', String(qTask?.d.output || '').includes('/merged/'), qTask?.d.output);
+check('单任务产物不带任务号', /api_merge_a_merged\.mp4$/.test(qTask?.d.output || ''), qTask?.d.output);
+
+// A per-task path must be honoured — the UI sends one for a single task and
+// for renamed tasks, and it used to be shown in the dialog but never submitted.
+const manualOut = join(DIR, '.api_manual.mp4');
+const manEvts = await sse('/api/merge-queue', { tasks: [{ files: [ma, mb], output: manualOut }], mode: 'auto' });
+const manDone = manEvts.find((e) => e.ev === 'task-done');
+check('队列采用逐任务指定的输出路径', manDone?.d.output === manualOut, manDone?.d.output);
+check('指定路径的产物已生成', !!(await stat(manualOut).catch(() => null)));
+
+const badFile = join(DIR, '.api_qbad.mp4');
+await writeFile(badFile, 'not a video');
+const fEvts = await sse('/api/merge-queue', { tasks: [{ files: [badFile, ma] }], mode: 'auto', deleteSources: true });
+const fTask = fEvts.find((e) => e.ev === 'task-done');
+const fDone = fEvts.find((e) => e.ev === 'queue-done');
+check('含坏文件的任务判定失败', fTask?.d.ok === false);
+check('失败任务不删任何源', fTask?.d.deleted.length === 0);
+check('失败任务列出全部保留文件', fTask?.d.kept.length === 2, `${fTask?.d.kept.length}`);
+check('失败计入汇总', fDone?.d.failed === 1 && fDone?.d.deletedCount === 0);
+
+const seqEvts = await sse('/api/merge-queue', {
+  tasks: [{ files: [badFile, ma] }, { files: [ma, mb] }], mode: 'auto', deleteSources: false,
+});
+const seqDone = seqEvts.find((e) => e.ev === 'queue-done');
+check('前一任务失败不阻断队列', seqDone?.d.total === 2 && seqDone.d.tasks.length === 2, JSON.stringify(seqDone?.d?.tasks?.length));
+check('后续任务仍然成功', seqDone?.d.tasks[1].ok === true);
+check('多任务产物带补零任务号', /_merged_t02\.mp4$/.test(seqDone?.d.tasks?.[1]?.output || ''),
+  seqDone?.d.tasks?.[1]?.output);
+
+await rm(badFile, { force: true }).catch(() => {});
+await rm(manualOut, { force: true }).catch(() => {});
+await rm(join(DIR, 'merged'), { recursive: true, force: true }).catch(() => {});
+
+for (const f of [ma, mb, join(DIR, '.api_merged.mp4')]) await rm(f, { force: true }).catch(() => {});
 
 console.log(`\n=== API 结果： ${pass} 通过, ${fail} 失败 ===\n`);
 process.exit(fail ? 1 : 0);

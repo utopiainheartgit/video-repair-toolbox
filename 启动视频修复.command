@@ -1,12 +1,12 @@
 #!/bin/bash
-# 双击此文件即可启动视频修复工具并打开网页。
+# 双击此文件即可启动视频工具箱（修复 / 合并）并打开网页。
 cd "$(dirname "$0")" || exit 1
 
 PORT="${PORT:-8731}"
 URL="http://127.0.0.1:${PORT}"
 
 echo "============================================"
-echo "  视频修复工具"
+echo "  视频工具箱 · 修复 / 合并"
 echo "============================================"
 echo
 
@@ -51,7 +51,8 @@ else
   done
 fi
 
-# File System Access API (drag-folder + in-place overwrite) is Chromium-only.
+# Everything runs on real local paths, so any modern browser works; Chromium
+# builds are preferred because the native-picker flow is smoothest there.
 OPENED=""
 for APP in "Google Chrome" "Microsoft Edge" "Chromium" "Brave Browser" "Arc"; do
   if [ -d "/Applications/${APP}.app" ]; then
@@ -60,7 +61,7 @@ for APP in "Google Chrome" "Microsoft Edge" "Chromium" "Brave Browser" "Arc"; do
 done
 if [ -z "$OPENED" ]; then
   echo "⚠ 未检测到 Chrome/Edge，用默认浏览器打开。"
-  echo "  若默认是 Safari/Firefox，拖拽将无法覆盖原文件，请用「选择文件夹（原生）」。"
+  echo "  功能不受影响（全程走本地路径），只是原生选择器体验略差。"
   open "$URL"
 else
   echo "✓ 已在 ${OPENED} 中打开"

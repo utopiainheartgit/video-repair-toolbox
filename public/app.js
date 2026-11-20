@@ -1,7 +1,6 @@
 const $ = (id) => document.getElementById(id);
-const state = { items: [], running: false, abort: null, stopFlag: false, caps: null, rootHandle: null, phase: 'idle' };
+const state = { items: [], running: false, abort: null, stopFlag: false, caps: null, rootHandle: null, phase: 'idle', retryCount: 0 };
 const VIDEO_RE = /\.(mp4|m4v|mov|mkv|avi|webm|flv|wmv|mpg|mpeg|ts|m2ts|mts|3gp|3g2|ogv|vob|divx|f4v|rm|rmvb|asf|mxf)$/i;
-const HAS_HANDLE_API = typeof DataTransferItem !== 'undefined' && 'getAsFileSystemHandle' in DataTransferItem.prototype;
 
 function fmtSize(n) {
   if (!n) return '—';
@@ -21,26 +20,109 @@ function toast(msg, kind = '') {
   clearTimeout(t._t); t._t = setTimeout(() => { t.hidden = true; }, 4200);
 }
 
+// Promise-based themed confirmation dialog, replacing blocking window.confirm.
+// Resolves true on confirm, false on cancel / Esc / backdrop click.
+// opts: { title, subtitle, tone:'info'|'danger'|'warn', icon:'merge'|'repair'|'trash'|'arrow',
+//         stats:[{label,value,small?}], rows:[{label,value}], lines:[html], warn:html,
+//         confirmText, cancelText, dangerConfirm }
+const DLG_ICONS = {
+  merge: '<path d="M4 7h5l2 3h9v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7Z"/><path d="M4 7V6a2 2 0 0 1 2-2h4l2 3"/>',
+  repair: '<path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18v3h3l8.3-8.3a4 4 0 0 0 5.4-5.4l-3 3-3-3 3-3Z"/>',
+  trash: '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/><path d="M10 11v6M14 11v6"/>',
+  arrow: '<path d="M4 12h15M13 6l6 6-6 6"/>',
+};
+function askConfirm(opts = {}) {
+  const {
+    title = '请确认', subtitle = '', tone = 'info', icon = 'merge',
+    stats = [], rows = [], lines = [], warn = '',
+    confirmText = '确定', cancelText = '取消', dangerConfirm = false,
+  } = opts;
+  return new Promise((resolve) => {
+    const root = $('confirmRoot');
+    const stroke = tone === 'danger' ? '#ffb4ae' : tone === 'warn' ? '#e8c97a' : '#9dc0f5';
+    const statsHtml = stats.length
+      ? `<div class="dlg-stats${stats.length === 2 ? ' two' : ''}">${stats.map((s) =>
+          `<div class="dlg-stat"><div class="dlg-stat-l">${esc(s.label)}</div>`
+          + `<div class="dlg-stat-v${s.small ? ' sm' : ''}">${esc(s.value)}</div></div>`).join('')}</div>`
+      : '';
+    const rowsHtml = rows.map((r) =>
+      `<div class="dlg-row"><div class="dlg-row-l">${esc(r.label)}</div><div class="dlg-row-v">${esc(r.value)}</div></div>`).join('');
+    const linesHtml = lines.length ? `<div class="dlg-lines">${lines.join('<br>')}</div>` : '';
+    const warnHtml = warn
+      ? `<div class="dlg-warn"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v5m0 3h.01"/><path d="M10.3 3.9 2.6 17a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg><div>${warn}</div></div>`
+      : '';
+    const okClass = dangerConfirm ? 'btn-danger' : 'btn-primary';
+    root.innerHTML = `<div class="dlg-mask"><div class="dlg dlg-${tone}" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+      <div class="dlg-head">
+        <div class="dlg-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="${stroke}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${DLG_ICONS[icon] || DLG_ICONS.merge}</svg></div>
+        <div class="dlg-heading"><div class="dlg-title">${esc(title)}</div>${subtitle ? `<div class="dlg-sub">${esc(subtitle)}</div>` : ''}</div>
+      </div>
+      ${(statsHtml || rowsHtml || linesHtml || warnHtml) ? `<div class="dlg-body">${statsHtml}${rowsHtml}${linesHtml}${warnHtml}</div>` : ''}
+      <div class="dlg-foot">
+        <button type="button" class="btn" data-dlg="cancel">${esc(cancelText)}</button>
+        <button type="button" class="btn ${okClass}" data-dlg="ok">${esc(confirmText)}</button>
+      </div>
+    </div></div>`;
+    root.hidden = false;
+    const okBtn = root.querySelector('[data-dlg="ok"]');
+    const cancelBtn = root.querySelector('[data-dlg="cancel"]');
+    (dangerConfirm ? cancelBtn : okBtn).focus();
+    let settled = false;
+    const finish = (val) => {
+      if (settled) return;
+      settled = true;
+      document.removeEventListener('keydown', onKey, true);
+      root.hidden = true;
+      root.innerHTML = '';
+      resolve(val);
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish(false); }
+      else if (e.key === 'Enter') {
+        // Let a focused button handle its own activation; otherwise confirm.
+        if (document.activeElement === cancelBtn) { e.preventDefault(); finish(false); }
+        else { e.preventDefault(); finish(true); }
+      } else if (e.key === 'Tab') {
+        const btns = [cancelBtn, okBtn];
+        const i = btns.indexOf(document.activeElement);
+        e.preventDefault();
+        btns[(i + (e.shiftKey ? -1 : 1) + btns.length) % btns.length].focus();
+      }
+    };
+    document.addEventListener('keydown', onKey, true);
+    root.querySelector('.dlg-mask').addEventListener('mousedown', (e) => { if (e.target === e.currentTarget) finish(false); });
+    okBtn.onclick = () => finish(true);
+    cancelBtn.onclick = () => finish(false);
+  });
+}
+
 async function loadCaps() {
   try {
     const r = await fetch('/api/capabilities');
     const c = await r.json();
     state.caps = c;
-    $('caps').innerHTML = '';
-    const add = (text, cls, title) => {
-      const s = document.createElement('span');
-      s.className = `cap ${cls}`; s.textContent = text; if (title) s.title = title; $('caps').appendChild(s);
+    const ready = !!(c.ffmpeg && c.untrunc);
+    $('caps').innerHTML = `<div class="env" id="envBox">
+      <button type="button" class="env-btn" id="envBtn" aria-expanded="false" title="查看运行环境">
+        <span class="env-dot ${ready ? 'ok' : 'warn'}"></span>
+        <span>运行环境${ready ? '就绪' : '待检查'}</span>
+        <span class="env-caret">⌄</span>
+      </button>
+      <div class="env-panel" id="envPanel" hidden>
+        <div class="env-row"><span>解码器</span><b title="${esc(c.ffmpeg || '')}">${esc((c.ffmpeg || '').split(' Copyright')[0] || '—')}</b></div>
+        <div class="env-row"><span>结构修复</span><b class="${c.untrunc ? 'ok' : 'warn'}">${c.untrunc ? 'untrunc 已就绪' : 'untrunc 未安装'}</b></div>
+        <div class="env-row"><span>文件传输</span><b>本地路径 · 不上传字节</b></div>
+        ${c.logFile ? `<div class="env-row"><span>运行日志</span><b title="${esc(c.logFile)}">JSONL</b></div>` : ''}
+        <div class="env-note">所有导入方式统一走本地路径，服务端原地修复，不上传任何文件字节。</div>
+      </div>
+    </div>`;
+    $('envBtn').onclick = (e) => {
+      e.stopPropagation();
+      const p = $('envPanel');
+      p.hidden = !p.hidden;
+      $('envBtn').setAttribute('aria-expanded', String(!p.hidden));
+      $('envBtn').classList.toggle('open', !p.hidden);
     };
-    add(c.ffmpeg.split(' Copyright')[0], 'ok');
-    add(c.untrunc ? 'untrunc 已就绪' : 'untrunc 未安装', c.untrunc ? 'ok' : 'bad');
-    add(HAS_HANDLE_API ? '拖拽可原地覆盖' : '拖拽只读', HAS_HANDLE_API ? 'ok' : 'bad');
-    if (c.logFile) add('运行日志 JSONL', '', c.logFile);
-    if (!HAS_HANDLE_API) {
-      const n = $('modeNote');
-      n.hidden = false;
-      n.innerHTML = '当前浏览器不支持 File System Access API（Safari / Firefox 均不支持），拖进来的文件<b>无法写回原路径</b>。'
-        + '请改用「选择文件夹（原生）」或粘贴路径 —— 服务端直接原地修复，速度也更快。想用拖拽请换 Chrome / Edge。';
-    }
   } catch { toast('无法连接本地服务', 'bad'); }
 }
 
@@ -61,6 +143,10 @@ function renderStatusCounts() {
 
 function startStatus(mode, total) {
   Object.assign(status, { startedAt: Date.now(), total, done: 0, repaired: 0, skipped: 0, failed: 0, mode });
+  // Authoritative progress is the set of paths that produced a file-done event.
+  // Unlike the server's progress counter this stays correct across reconnects,
+  // where a stream can drop between file-done and progress.
+  state.completedPaths = new Set();
   const p = $('statusPanel');
   p.hidden = false; p.classList.remove('done', 'warn', 'bad');
   $('failedPanel').hidden = true;
@@ -134,6 +220,7 @@ async function readSSE(res, onEvent) {
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = '';
+  let gotDone = false;
   for (;;) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -146,15 +233,18 @@ async function readSSE(res, onEvent) {
         if (l.startsWith('event: ')) ev = l.slice(7);
         else if (l.startsWith('data: ')) data += l.slice(6);
       }
-      if (data) onEvent(ev, JSON.parse(data));
+      // ': ping' heartbeat has no data field and is intentionally ignored.
+      if (data) { if (ev === 'done') gotDone = true; onEvent(ev, JSON.parse(data)); }
     }
   }
+  return gotDone;
 }
 
-function addItem(it) {
+function addItem(it, { quiet = false } = {}) {
   if (state.items.some((x) => x.key === it.key)) return false;
-  state.items.push({ ...it, status: 'pending', logs: [], diagnosis: null, strategy: '', reasons: [], selected: true });
+  state.items.push({ ...it, status: 'pending', logs: [], diagnosis: null, strategy: '', reasons: [], selected: true, attempts: [] });
   invalidateRepairList();
+  if (!quiet) render();
   return true;
 }
 
@@ -175,7 +265,7 @@ function render() {
     const detail = it.status === 'running'
       ? `<span style="color:var(--accent)">${esc(it.stage || '处理中…')}</span>`
       : it.status === 'repaired'
-      ? `<span class="strat">${esc(it.strategy)}</span>`
+      ? `<span class="strat">${esc(it.strategy)}</span>${it.level === 'degraded' ? '<span class="badge degraded">降级可用</span>' : ''}`
       : it.reasons?.length
         ? `<span class="why">${esc(it.reasons.join('；').slice(0, 160))}</span>`
         : it.diagnosis?.problems?.length
@@ -242,7 +332,17 @@ function buildLogText(it) {
     if (d.probeError) L.push(`ffprobe: ${d.probeError}`);
   }
   if (it.tried?.length) L.push(`尝试策略: ${it.tried.join(' → ')}`);
+  if (it.attempts?.length) {
+    L.push('--- 策略明细 ---');
+    for (const a of it.attempts) {
+      const tag = a.ok ? (a.level === 'degraded' ? '降级' : '通过') : '未通过';
+      const secs = a.ms != null ? ` ${(a.ms / 1000).toFixed(1)}s` : '';
+      const why = (a.reasons || []).join('；').slice(0, 90);
+      L.push(`  [${tag}] ${a.strategy}${secs}${why ? ' — ' + why : ''}`);
+    }
+  }
   if (it.strategy) L.push(`成功策略: ${it.strategy}`);
+  if (it.level === 'degraded') L.push('注意: 降级修复产物可播放，但可能仍有残留解码错误，建议另存备份。');
   for (const r of it.reasons || []) L.push(`失败原因: ${r}`);
   if (it.logs.length) { L.push('', '--- 修复日志 ---', ...it.logs); }
   return L.join('\n') || '（暂无日志，点击行展开/收起）';
@@ -363,9 +463,8 @@ function renderFailedPanel() {
   const panel = $('failedPanel');
   if (!list.length || state.running) { panel.hidden = true; return; }
   panel.hidden = false;
-  const handleN = list.filter((i) => i.mode === 'handle').length;
   $('fpTitle').textContent = `${list.length} 个文件修复失败`;
-  $('fpSub').textContent = '原文件均保持不动，可手动处理或一键删除';
+  $('fpSub').textContent = '原文件均保持不动，可单独重试或一键删除';
   const body = $('fpList');
   body.innerHTML = '';
   for (const it of list) {
@@ -373,37 +472,74 @@ function renderFailedPanel() {
     row.className = 'fp-row';
     const why = (it.reasons || []).join('；') || '修复失败';
     row.innerHTML = `<span class="fp-name"><span class="fname" title="${esc(it.path || it.name)}">${esc(it.name)}</span>`
-      + `<span class="frel">${esc(it.rel || (it.mode === 'handle' ? '拖拽句柄' : ''))}</span></span>`
+      + `<span class="frel">${esc(it.rel || '')}</span></span>`
       + `<span class="fp-size">${fmtSize(it.size)}</span>`
       + `<span class="fp-why" title="${esc(why)}">${esc(why)}</span>`;
     body.appendChild(row);
   }
-  $('fpNote').innerHTML = handleN
-    ? `路径模式 ${list.length - handleN} 个移入<strong>废纸篓</strong>（可还原）；拖拽模式 ${handleN} 个因浏览器限制<strong>永久删除</strong>。`
-    : '全部移入<strong>废纸篓</strong>，可随时还原。';
-  $('fpDelete').textContent = handleN === list.length
-    ? `永久删除 ${list.length} 个失败源文件`
-    : `删除 ${list.length} 个失败源文件（移入废纸篓）`;
+  $('fpNote').innerHTML = '全部移入<strong>废纸篓</strong>，可随时还原。';
+  $('fpDelete').textContent = `删除 ${list.length} 个失败源文件（移入废纸篓）`;
+}
+
+// Retry only the failed files. They go through the same diagnose→confirm→repair
+// flow; healthy/repaired files are never touched. Failed items are marked
+// pending first so the normal start() pipeline picks them up.
+let retryArmed = false;
+let retryArmTimer = null;
+function resetRetryButton() {
+  retryArmed = false;
+  clearTimeout(retryArmTimer);
+  const b = $('fpRetry');
+  if (b) { b.textContent = '重试失败项'; b.classList.remove('armed'); }
+}
+function retryFailed() {
+  const list = failedItems();
+  if (!list.length || state.running) return;
+  const btn = $('fpRetry');
+  if (!retryArmed) {
+    // First click arms a lightweight two-step confirmation — no modal needed
+    // for this harmless action, but it still avoids accidental clicks.
+    retryArmed = true;
+    btn.textContent = `再点一次，重试 ${list.length} 项`;
+    btn.classList.add('armed');
+    btn.title = '仅重新诊断并修复失败文件，健康/已修复文件不改动';
+    clearTimeout(retryArmTimer);
+    retryArmTimer = setTimeout(resetRetryButton, 4000);
+    return;
+  }
+  resetRetryButton();
+  for (const it of list) {
+    it.status = 'pending'; it.diagnosis = null; it.reasons = [];
+    it.attempts = []; it.logs = [];
+  }
+  $('failedPanel').hidden = true;
+  start('repair', list);
 }
 
 async function deleteFailed(list, { ask = true } = {}) {
   const empty = { trashed: 0, removed: 0, errors: [] };
   if (!list.length || state.running) return empty;
-  const pathItems = list.filter((i) => i.mode === 'path');
-  const handleItems = list.filter((i) => i.mode === 'handle');
+  const pathItems = list.filter((i) => i.mode === 'path' || i.mode === 'handle');
   if (ask) {
     const bytes = list.reduce((n, it) => n + (it.size || 0), 0);
-    const lines = list.map((it) => `· ${it.name}（${fmtSize(it.size)}）→ ${it.mode === 'handle' ? '永久删除' : '废纸篓'}`).join('\n');
-    const warn = handleItems.length
-      ? `\n\n注意：${handleItems.length} 个拖拽模式文件受浏览器限制将被【永久删除】，无法还原。`
-      : '\n\n全部移入废纸篓，可随时还原。';
-    if (!confirm(`即将删除 ${list.length} 个修复失败的源文件（${fmtSize(bytes)}）：\n\n${lines}${warn}\n\n只删除失败文件，健康 / 已修复的文件不受影响。确定继续？`)) return empty;
+    const ok = await askConfirm({
+      title: '删除失败源文件',
+      subtitle: `将 ${list.length} 个修复失败的文件移入废纸篓`,
+      icon: 'trash', tone: 'danger',
+      stats: [
+        { label: '文件数', value: String(list.length) },
+        { label: '涉及大小', value: fmtSize(bytes) },
+      ],
+      lines: ['只删除失败文件，健康 / 已修复的文件不受影响。'],
+      warn: '文件移入废纸篓，可随时还原；不会永久删除。',
+      confirmText: '移入废纸篓', dangerConfirm: true,
+    });
+    if (!ok) return empty;
   }
-  if (handleItems.length && !await ensureWritePermission(handleItems)) return empty;
   const btn = $('fpDelete');
   btn.disabled = true;
   const errors = [];
-  let trashedN = 0, removedN = 0;
+  let trashedN = 0;
   if (pathItems.length) {
     try {
       const r = await fetch('/api/trash-failed', {
@@ -420,89 +556,68 @@ async function deleteFailed(list, { ask = true } = {}) {
       for (const it of pathItems) errors.push(it.name);
     }
   }
-  for (const it of handleItems) {
-    try {
-      await it.handle.remove();
-      it.status = 'deleted'; removedN++;
-    } catch {
-      errors.push(it.name);
-    }
-  }
   btn.disabled = false;
   renderFailedPanel();
   render();
   const parts = [];
   if (trashedN) parts.push(`${trashedN} 个已移入废纸篓`);
-  if (removedN) parts.push(`${removedN} 个已永久删除`);
   if (errors.length) parts.push(`${errors.length} 个删除失败：${errors.slice(0, 3).join('、')}${errors.length > 3 ? ' 等' : ''}`);
   toast(parts.join('；') || '没有可删除的文件', errors.length ? 'bad' : 'ok');
-  return { trashed: trashedN, removed: removedN, errors };
+  return { trashed: trashedN, removed: 0, errors };
 }
 
 // ---------- intake ----------
-async function walkHandle(dirHandle, prefix, out) {
-  for await (const entry of dirHandle.values()) {
-    if (entry.name.startsWith('.')) continue;
-    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
-    if (entry.kind === 'directory') await walkHandle(entry, rel, out);
-    else if (VIDEO_RE.test(entry.name)) {
-      const f = await entry.getFile();
-      out.push({ key: `h:${rel}`, name: entry.name, rel, size: f.size, mode: 'handle', handle: entry });
-    }
-  }
-}
-
+// Drag/drop never exposes a full local path in the browser (a hard security
+// limit). Since the server runs on this same machine, all intake is unified on
+// path mode: dropping files opens the native picker so we obtain real paths and
+// repair in place — no file bytes are ever uploaded through the browser.
 async function intakeDataTransfer(dt) {
   const items = [...dt.items];
-  const handles = [];
-  if (HAS_HANDLE_API) {
-    for (const it of items) {
-      if (it.kind !== 'file') continue;
-      try { const h = await it.getAsFileSystemHandle(); if (h) handles.push(h); } catch { /* ignore */ }
-    }
-  }
-  if (handles.length) {
-    const out = [];
-    let rootDir = null;
-    for (const h of handles) {
-      if (h.kind === 'directory') { rootDir = h; await walkHandle(h, h.name, out); }
-      else if (VIDEO_RE.test(h.name)) {
-        const f = await h.getFile();
-        out.push({ key: `h:${h.name}`, name: h.name, rel: '', size: f.size, mode: 'handle', handle: h });
-      }
-    }
-    if (rootDir) state.rootHandle = rootDir;
-    let added = 0;
-    for (const o of out) if (addItem(o)) added++;
-    toast(added ? `已载入 ${added} 个视频（拖拽句柄模式）` : '没有新增视频文件', added ? 'ok' : '');
-    render();
-    return;
-  }
-
-  // No handle API: read-only entries. Diagnosis is possible but write-back is not.
   const files = [...dt.files].filter((f) => VIDEO_RE.test(f.name));
-  if (files.length) {
-    toast('此浏览器无法写回原文件，请用「选择文件夹（原生）」或粘贴路径', 'bad');
-    $('modeNote').hidden = false;
+  const entries = items.map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
+  const hasDir = entries.some((e) => e.isDirectory);
+  if (!files.length && !hasDir && !entries.length) { toast('没有识别到视频文件', 'bad'); return; }
+
+  toast('正在打开原生选择器以获取真实路径（拖入的内容需在弹窗中确认），随后直接原地修复…', '');
+  if (hasDir) {
+    const r = await fetch('/api/pick-folder', { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) await loadPath(d.path);
+    else if (!d.cancelled) toast(d.error || '选择失败', 'bad');
   } else {
-    const entries = items.map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
-    if (entries.some((e) => e.isDirectory)) toast('此浏览器无法写回原文件，请用「选择文件夹（原生）」或粘贴路径', 'bad');
-    else toast('没有识别到视频文件', 'bad');
+    const d = await fetch('/api/pick-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ multiple: true }) }).then((r) => r.json()).catch(() => null);
+    if (d?.ok) {
+      if (!d.paths.length) toast('所选文件中没有视频', 'bad');
+      else { const { added } = await loadPaths(d.paths); toast(added ? `已载入 ${added} 个视频（路径模式 · 原地覆盖）` : '没有新增视频文件', added ? 'ok' : ''); }
+    } else if (d && !d.cancelled) toast(d.error || '选择失败', 'bad');
   }
 }
 
+// Scan many paths in a single request. The server normalises/dedupes and scans
+// with bounded concurrency, so pasting hundreds of links no longer issues
+// hundreds of serial requests that can stall or get stuck.
 async function loadPaths(paths) {
-  const results = [];
+  const results = new Array(paths.length);
   let added = 0;
-  for (const p of paths) {
-    try {
-      const r = await fetch('/api/scan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: p }) });
-      const d = await r.json();
-      if (!r.ok) { results.push({ path: p, ok: false, error: d.error || `HTTP ${r.status}` }); continue; }
+  try {
+    const r = await fetch('/api/scan-many', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths }) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+    // Per-input report, aligned to the original paste order. addItem dedupes
+    // by key, so overlaps between paths (folder + a file inside it) are safe.
+    for (let i = 0; i < paths.length; i++) {
+      const r = d.results?.[i] || { ok: false, error: '无扫描结果' };
       let n = 0;
-      for (const f of d.files) if (addItem({ key: `p:${f.path}`, name: f.name, rel: f.rel, size: f.size, mode: 'path', path: f.path })) { added++; n++; }
-      results.push({ path: p, ok: true, kind: d.kind || 'dir', count: d.files.length, added: n });
-    } catch (e) { results.push({ path: p, ok: false, error: String(e) }); }
+      if (r.ok) {
+        for (const f of (r.files || [])) {
+          if (addItem({ key: `p:${f.path}`, name: f.name, rel: f.rel, size: f.size, mode: 'path', path: f.path }, { quiet: true })) { added++; n++; }
+        }
+      }
+      results[i] = { path: r.input ?? paths[i], ok: r.ok, kind: r.kind, count: r.count, added: n, error: r.error };
+    }
+    if (d.duplicates > 0) toast(`已跳过 ${d.duplicates} 个重复路径`, '');
+  } catch (e) {
+    for (let i = 0; i < paths.length; i++) results[i] = { input: paths[i], ok: false, error: String(e) };
   }
   state.rootHandle = null;
   render();
@@ -609,35 +724,61 @@ function setRunning(on) {
   render();
 }
 
-async function ensureWritePermission(items) {
-  const targets = state.rootHandle ? [state.rootHandle] : items.filter((i) => i.mode === 'handle').map((i) => i.handle);
-  for (const h of targets) {
-    if (!h?.queryPermission) continue;
-    const opts = { mode: 'readwrite' };
-    if (await h.queryPermission(opts) === 'granted') continue;
-    if (await h.requestPermission(opts) !== 'granted') {
-      toast('没有写入授权，无法覆盖原文件', 'bad');
-      return false;
-    }
-    if (state.rootHandle) break;
-  }
-  return true;
-}
-
 async function runPathMode(mode, items) {
-  const files = items.map((i) => i.path);
-  if (!files.length) return 0;
-  const ctrl = new AbortController();
-  state.abort = ctrl;
+  if (!items.length) return 0;
   const byPath = new Map(items.map((i) => [i.path, i]));
-  const res = await fetch('/api/jobs', {
-    method: 'POST', signal: ctrl.signal,
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ mode, files, deep: $('deep').value === '1', allowReencode: $('allowReencode').checked, reference: $('refPath').value || null }),
-  });
-  if (!res.ok) throw new Error(`服务端错误 ${res.status}`);
-  await readSSE(res, (ev, d) => handleEvent(ev, d, byPath));
-  return files.length;
+  // Iterative resume: each round sends only the files not yet completed. If the
+  // SSE stream drops before the server's 'done' event, we reconnect from the
+  // last completed file instead of restarting hundreds of files from scratch.
+  let pending = items.slice();
+  const MAX_RECONNECT = 3;
+  let reconnect = 0;
+  while (pending.length && !state.stopFlag) {
+    const files = pending.map((i) => i.path);
+    const donePaths = new Set();
+    const ctrl = new AbortController();
+    state.abort = ctrl;
+    let gotDone = false;
+    let res;
+    try {
+      res = await fetch('/api/jobs', {
+        method: 'POST', signal: ctrl.signal,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode, files, deep: $('deep').value === '1',
+          allowReencode: $('allowReencode').checked,
+          reference: $('refPath').value || null,
+          resumeFrom: state.completedPaths ? state.completedPaths.size : status.done,
+        }),
+      });
+      if (!res.ok) throw new Error(`服务端错误 ${res.status}`);
+      gotDone = await readSSE(res, (ev, d) => {
+        if (ev === 'file-done' && d.path) donePaths.add(d.path);
+        handleEvent(ev, d, byPath);
+      });
+    } catch (e) {
+      if (e.name === 'AbortError') break;
+      // A dropped connection shows up here; treat like an incomplete stream.
+      gotDone = false;
+    } finally {
+      state.abort = null;
+    }
+
+    // Keep only files that never produced a file-done event.
+    pending = pending.filter((i) => !donePaths.has(i.path));
+    if (gotDone || state.stopFlag || !pending.length) break;
+    reconnect++;
+    if (reconnect > MAX_RECONNECT) {
+      toast(`连接多次中断，仍有 ${pending.length} 个文件未完成。请检查后对失败项重试`, 'bad');
+      for (const i of pending) { i.status = 'pending'; i.percent = null; i.stage = ''; }
+      render();
+      break;
+    }
+    const completedN = state.completedPaths ? state.completedPaths.size : status.done;
+    toast(`连接中断，正在从第 ${completedN + 1} 个续跑剩余 ${pending.length} 个文件…`, '');
+    await new Promise((r) => setTimeout(r, 600));
+  }
+  return items.length;
 }
 
 function handleEvent(ev, d, byPath) {
@@ -658,126 +799,28 @@ function handleEvent(ev, d, byPath) {
     it.status = d.action === 'repaired' ? 'repaired' : d.action === 'skipped' ? 'skipped'
       : d.action === 'failed' ? 'failed' : d.verdict;
     it.strategy = d.strategy || ''; it.reasons = d.reasons || []; it.tried = d.tried || [];
+    it.level = d.level || null; it.attempts = d.attempts || [];
     it.percent = null; it.stage = '';
     if (d.action === 'repaired') status.repaired++;
     else if (d.action === 'skipped') status.skipped++;
     else if (d.action === 'failed') status.failed++;
     else if (d.action === 'diagnosed') { if (d.verdict === 'healthy') status.skipped++; else status.failed++; }
+    // Count each path once even if a reconnect re-delivers a file-done.
+    if (d.path && state.completedPaths) state.completedPaths.add(d.path);
+    setOverall(state.completedPaths ? state.completedPaths.size : status.done + 1, status.total);
     renderStatusCounts(); render();
   } else if (ev === 'progress') {
-    setOverall(d.done, status.total);
+    // Progress is advisory only; authoritative done count comes from file-done.
   } else if (ev === 'done') {
-    setOverall(d.total, status.total);
+    if (state.completedPaths) setOverall(state.completedPaths.size, status.total);
+    else setOverall(d.total, status.total);
+    // Use the client-side accumulated counts: the server's per-round counters
+    // restart at 0 on each reconnect, so they under-report across resumes.
     if (state.mode === 'diagnose') {
-      const bad = d.total - d.skipped;
-      toast(`诊断完成：健康 ${d.skipped} · 有问题 ${bad}`, bad ? '' : 'ok');
+      const healthy = status.skipped, bad = status.failed;
+      toast(`诊断完成：健康 ${healthy} · 有问题 ${bad}`, bad ? '' : 'ok');
     } else {
-      toast(`完成：修复 ${d.repaired} · 跳过 ${d.skipped} · 失败 ${d.failed}`, d.failed ? 'bad' : 'ok');
-    }
-  }
-}
-
-function uploadWithProgress(file, name, onPct) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', `/api/stage?name=${encodeURIComponent(name)}`);
-    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-    xhr.upload.onprogress = (e) => { if (e.lengthComputable) onPct((e.loaded / e.total) * 100, e.loaded); };
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try { resolve(JSON.parse(xhr.responseText)); } catch (e) { reject(e); }
-      } else reject(new Error(`上传失败 ${xhr.status}`));
-    };
-    xhr.onerror = () => reject(new Error('上传网络错误'));
-    xhr.onabort = () => reject(new Error('上传已取消'));
-    xhr.send(file);
-  });
-}
-
-async function runHandleMode(mode, items, offset = 0) {
-  for (let n = 0; n < items.length; n++) {
-    if (state.stopFlag) break;
-    const it = items[n];
-    const idx = offset + n;
-    it.status = 'running'; it.logs = []; it.percent = null; it.stage = '读取文件…';
-    setFileProgress({ name: it.name, index: idx, stage: '读取文件…', percent: null });
-    setOverall(idx, status.total);
-    render();
-    let stageId = null, resultId = null;
-    try {
-      const file = await it.handle.getFile();
-      it.size = file.size;
-      it.logs.push(`上传到本地服务（${fmtSize(file.size)}）…`);
-      setFileProgress({ name: it.name, index: idx, stage: '上传到本地服务', percent: 0 });
-      const up = await uploadWithProgress(file, it.name, (pct, loaded) => {
-        it.percent = pct; it.stage = '上传到本地服务';
-        setFileProgress({ name: it.name, index: idx, stage: '上传到本地服务', percent: pct, size: loaded });
-        updateRowProgress(it);
-      });
-      stageId = up.id;
-
-      const rr = await fetch('/api/repair-staged', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: stageId, mode, stream: true, deep: $('deep').value === '1', allowReencode: $('allowReencode').checked }),
-      });
-      if (!rr.ok) throw new Error(`服务端错误 ${rr.status}`);
-      let d = null;
-      await readSSE(rr, (ev, p) => {
-        if (ev === 'file-progress') {
-          it.percent = p.percent; it.stage = p.stage;
-          setFileProgress({ name: it.name, index: idx, stage: p.stage, percent: p.percent, speed: p.speed, fps: p.fps, outTime: p.outTime, size: p.size });
-          updateRowProgress(it);
-        } else if (ev === 'log') { it.logs.push(p.message); if (it.open) render(); }
-        else if (ev === 'diagnosis') { it.diagnosis = p.diagnosis; render(); }
-        else if (ev === 'result') d = p;
-      });
-      if (!d) throw new Error('服务端未返回结果');
-      it.tried = d.tried || [];
-
-      if (state.stopFlag) {
-        it.status = 'pending'; it.logs.push('已停止，原文件未改动');
-      } else if (mode === 'diagnose') {
-        it.status = d.diagnosis.verdict;
-        if (it.status === 'healthy') status.skipped++; else status.failed++;
-      } else if (d.action === 'skipped') {
-        it.status = 'skipped'; status.skipped++; it.logs.push('文件健康，跳过');
-      } else if (d.action === 'repaired') {
-        resultId = d.resultId;
-        it.logs.push(`下载修复产物并写回原文件（策略：${d.strategy}）…`);
-        const dl = await fetch(`/api/fetch/${resultId}`);
-        if (!dl.ok) throw new Error('下载修复产物失败');
-        const totalBytes = Number(dl.headers.get('Content-Length')) || 0;
-        const writable = await it.handle.createWritable();
-        const reader = dl.body.getReader();
-        let received = 0;
-        for (;;) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          await writable.write(value);
-          received += value.length;
-          const pct = totalBytes ? (received / totalBytes) * 100 : null;
-          it.percent = pct; it.stage = '写回原文件';
-          setFileProgress({ name: it.name, index: idx, stage: '写回原文件', percent: pct, size: received });
-          updateRowProgress(it);
-        }
-        await writable.close();
-        it.status = 'repaired'; it.strategy = d.strategy; status.repaired++;
-        it.logs.push('已覆盖原文件');
-      } else {
-        it.status = 'failed'; it.reasons = d.reasons || ['修复失败']; status.failed++;
-        it.logs.push('原文件未改动');
-      }
-    } catch (e) {
-      it.status = 'failed'; it.reasons = [String(e)]; status.failed++;
-      it.logs.push(`出错：${e}`);
-    } finally {
-      for (const id of [stageId, resultId]) {
-        if (id) fetch(`/api/staged/${id}`, { method: 'DELETE' }).catch(() => {});
-      }
-      it.percent = null; it.stage = '';
-      renderStatusCounts();
-      setOverall(idx + 1, status.total);
-      render();
+      toast(`完成：修复 ${status.repaired} · 跳过 ${status.skipped} · 失败 ${status.failed}`, status.failed ? 'bad' : 'ok');
     }
   }
 }
@@ -791,11 +834,8 @@ async function start(mode, targets) {
   startStatus(mode, targets.length);
   setRunning(true);
   try {
-    const pathItems = targets.filter((i) => i.mode === 'path');
-    const handleItems = targets.filter((i) => i.mode === 'handle');
-    let offset = 0;
-    if (pathItems.length) offset = await runPathMode(mode, pathItems);
-    if (handleItems.length && !state.stopFlag) await runHandleMode(mode, handleItems, offset);
+    const pathItems = targets.filter((i) => i.mode === 'path' || i.mode === 'handle');
+    if (pathItems.length) await runPathMode(mode, pathItems);
   } catch (e) {
     if (e.name !== 'AbortError') toast(`执行出错：${e}`, 'bad');
   } finally {
@@ -830,43 +870,16 @@ drop.addEventListener('click', (e) => { if (e.target === drop || (e.target.close
 drop.addEventListener('keydown', (e) => { if (e.target.closest('input,textarea,button,select')) return; if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pickFiles(); } });
 
 async function pickFiles() {
-  if (HAS_HANDLE_API && window.showOpenFilePicker) {
-    try {
-      const handles = await window.showOpenFilePicker({ multiple: true, excludeAcceptAllOption: false });
-      let added = 0;
-      for (const h of handles) {
-        if (!VIDEO_RE.test(h.name)) continue;
-        const f = await h.getFile();
-        if (addItem({ key: `h:${h.name}`, name: h.name, rel: '', size: f.size, mode: 'handle', handle: h })) added++;
-      }
-      toast(added ? `已载入 ${added} 个视频（可原地覆盖）` : '没有新增视频文件', added ? 'ok' : '');
-      render();
-      return;
-    } catch (e) { if (e.name === 'AbortError') return; }
-  }
   const d = await fetch('/api/pick-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ multiple: true }) }).then((r) => r.json()).catch(() => null);
   if (d?.ok) {
     if (!d.paths.length) toast('所选文件中没有视频', 'bad');
-    else { const { added } = await loadPaths(d.paths); toast(added ? `已载入 ${added} 个视频（路径模式 · 免上传）` : '没有新增视频文件', added ? 'ok' : ''); }
-  }
-  else if (d && !d.cancelled) toast(d.error || '选择失败', 'bad');
+    else { const { added } = await loadPaths(d.paths); toast(added ? `已载入 ${added} 个视频（路径模式 · 原地覆盖）` : '没有新增视频文件', added ? 'ok' : ''); }
+  } else if (d && !d.cancelled) toast(d.error || '选择失败', 'bad');
 }
 
 $('pickFiles').onclick = (e) => { e.stopPropagation(); pickFiles(); };
 $('pickFolder').onclick = async (e) => {
   e.stopPropagation();
-  if (HAS_HANDLE_API) {
-    try {
-      const h = await window.showDirectoryPicker({ mode: 'readwrite' });
-      state.rootHandle = h;
-      const out = [];
-      await walkHandle(h, h.name, out);
-      let added = 0;
-      for (const o of out) if (addItem(o)) added++;
-      toast(added ? `已载入 ${added} 个视频（可原地覆盖）` : '该文件夹没有视频', added ? 'ok' : '');
-      render(); return;
-    } catch (err) { if (err.name === 'AbortError') return; }
-  }
   const r = await fetch('/api/pick-folder', { method: 'POST' });
   const d = await r.json();
   if (d.ok) await loadPath(d.path);
@@ -906,14 +919,24 @@ $('rlConfirm').onclick = async () => {
   const sel = selectedForRepair();
   if (!sel.length || state.running) return;
   const bytes = sel.reduce((n, it) => n + (it.size || 0), 0);
-  const ok = confirm(`即将修复并【直接覆盖】${sel.length} 个原文件（${fmtSize(bytes)}），不保留备份。\n\n`
-    + '安全保证：修复产物先写临时文件，通过校验（可解析、时长不短于原片 90%、可解码）才替换原名；'
-    + '任何一步失败，原文件保持不动。\n\n清单之外和未勾选的文件不会被改动。确定继续？');
+  const ok = await askConfirm({
+    title: '确认修复并覆盖原文件',
+    subtitle: `即将直接覆盖 ${sel.length} 个原文件，不保留备份`,
+    icon: 'repair', tone: 'danger',
+    stats: [
+      { label: '待修复', value: String(sel.length) },
+      { label: '涉及大小', value: fmtSize(bytes) },
+    ],
+    lines: ['<b>安全保证：</b>产物先写临时文件，通过校验（可解析、时长不短于原片 90%、可解码）才替换原名。',
+      '任何一步失败，原文件保持不动；清单之外和未勾选的文件不会被改动。'],
+    warn: '此操作会直接覆盖原文件且不保留备份。请确认已了解风险。',
+    confirmText: '确认修复', dangerConfirm: true,
+  });
   if (!ok) return;
-  if (sel.some((i) => i.mode === 'handle') && !await ensureWritePermission(sel)) return;
   $('repairPanel').hidden = true;
   start('repair', sel);
 };
+$('fpRetry').onclick = retryFailed;
 $('fpDelete').onclick = () => deleteFailed(failedItems(), { ask: true });
 $('btnClear').onclick = () => {
   state.items = []; state.rootHandle = null;
@@ -928,3 +951,794 @@ $('btnStop').onclick = () => { state.stopFlag = true; state.abort?.abort(); toas
 loadCaps();
 updatePasteMeta();
 render();
+// ============================ 合并视频 ============================
+// Same intake philosophy as repair: only real local paths ever reach the
+// server, so clips are never uploaded. Order in this list is the merge order.
+const mstate = {
+  clips: [], running: false, abort: null, stopFlag: false,
+  plan: null, plans: [], suggested: '', suggestedList: [], lastOutput: '', logs: [],
+  summary: null,
+  drag: -1, planTimer: null, planSeq: 0, timer: null,
+};
+
+function switchView(view, { hash = true } = {}) {
+  for (const t of document.querySelectorAll('.tab')) {
+    const on = t.dataset.view === view;
+    t.classList.toggle('active', on);
+    t.setAttribute('aria-selected', String(on));
+  }
+  $('viewRepair').hidden = view !== 'repair';
+  $('viewMerge').hidden = view !== 'merge';
+  // Deep-linkable: #merge opens the merge tab directly.
+  if (hash) history.replaceState(null, '', view === 'merge' ? '#merge' : '#repair');
+  if (view === 'merge' && mstate.clips.length && !mstate.plans.length) mSchedulePlan();
+}
+for (const t of document.querySelectorAll('.tab')) t.onclick = () => switchView(t.dataset.view);
+
+function mActionTag(c) {
+  if (c.error) return '<span class="mtag skip">跳过</span>';
+  if (c.action === undefined) return '<span class="mtag none">分析中…</span>';
+  if (c.action === null) return '<span class="mtag none">—</span>';
+  const map = {
+    copy: ['copy', '无损'], remux: ['remux', '重封装'], audio: ['audio', '仅修音频'],
+    silence: ['audio', '补静音'], encode: ['encode', '重编码'], skip: ['skip', '跳过'],
+  };
+  const [cls, label] = map[c.action] || ['none', c.action];
+  return `<span class="mtag ${cls}">${label}</span>`;
+}
+
+function clipActionOf(info, plan) {
+  if (!info || !info.ok) return null;
+  if (!plan || !plan.ok) return null;
+  if (plan.strategy === 'copy') return 'copy';
+  if (plan.strategy === 'remux') return 'remux';
+  if (plan.copyVideo) return info.audio ? 'audio' : 'silence';
+  return 'encode';
+}
+
+function mAppendFiles(files) {
+  let added = 0;
+  for (const f of files) {
+    if (mstate.clips.some((c) => c.path === f.path)) continue;
+    mstate.clips.push({
+      path: f.path, name: f.name, size: f.size, rel: f.rel || '',
+      dur: 0, info: null, error: null, action: undefined, breakAfter: false,
+    });
+    added++;
+  }
+  return added;
+}
+
+// Products land in `merged/` next to the first clip, so the run never mixes
+// them into the pile of source fragments.
+function mDirOf(p) {
+  const i = Math.max(String(p).lastIndexOf('/'), String(p).lastIndexOf('\\'));
+  return i > 0 ? String(p).slice(0, i) : '.';
+}
+const mBaseOf = (p) => String(p).split(/[\\/]/).pop() || '';
+
+// A per-task name override rides on the group's first clip (`outName`), so it
+// survives splitting and reordering without a parallel array to keep in sync.
+// A bare filename goes into `merged/`; anything with a slash is relative to the
+// first clip's directory; an absolute path wins outright.
+function mTaskOutput(group) {
+  const s = String(group[0]?.outName || '').trim();
+  if (!s) return null;
+  if (s.startsWith('/') || /^[A-Za-z]:[\\/]/.test(s)) return s;
+  const dir = mDirOf(group[0].path);
+  return s.includes('/') ? `${dir}/${s}` : `${dir}/merged/${s}`;
+}
+
+// A task boundary lives on the clip before it (`breakAfter`), so reordering and
+// removal keep groups coherent without a second array to keep in sync.
+function mSplitTasks() {
+  const tasks = [];
+  let cur = [];
+  const clips = mstate.clips;
+  for (let i = 0; i < clips.length; i++) {
+    cur.push(clips[i]);
+    if (clips[i].breakAfter || i === clips.length - 1) {
+      tasks.push(cur);
+      cur = [];
+    }
+  }
+  return tasks;
+}
+
+function mRenderRow(c, i, list, canSplit) {
+  const row = document.createElement('div');
+  row.className = 'mrow' + (c.error ? ' bad-row' : '');
+  row.draggable = true;
+  row.dataset.i = String(i);
+  const dur = c.dur ? fmtDur(c.dur) : (c.error ? '—' : '…');
+  const size = c.size ? fmtSize(c.size) : '';
+  const spec = c.info
+    ? `${c.info.video.width}×${c.info.video.height} · ${c.info.video.codec}${c.info.video.fps ? ` · ${Math.round(c.info.video.fps)}fps` : ''}${c.info.audio ? '' : ' · 无音轨'}`
+    : (c.error || '分析中…');
+  const split = canSplit
+    ? `<button type="button" data-act="split" class="split${c.breakAfter ? ' on' : ''}" title="${c.breakAfter ? '把下一个片段并回本任务' : '从这一行之后切成新任务'}">⊟</button>`
+    : '<button type="button" disabled title="最后一段无需分割">⊟</button>';
+  row.innerHTML = `<span class="c-ord">${i + 1}</span>`
+    + `<span class="c-name"><span class="fname" title="${esc(c.path)}">${esc(c.name)}</span>`
+    + `<span class="frel" title="${esc(c.rel)}">${esc(c.rel)}</span></span>`
+    + `<span class="c-size">${dur}${size ? ' · ' + size : ''}</span>`
+    + `<span class="c-status"><span class="mrow-meta" title="${esc(spec)}">${esc(spec)}</span></span>`
+    + `<span class="c-detail">${mActionTag(c)}</span>`
+    + `<span class="c-ops">`
+    + `<button type="button" data-act="up" title="上移"${i === 0 ? ' disabled' : ''}>↑</button>`
+    + `<button type="button" data-act="down" title="下移"${i === mstate.clips.length - 1 ? ' disabled' : ''}>↓</button>`
+    + split
+    + `<button type="button" data-act="rm" class="rm" title="移除">✕</button>`
+    + `</span>`;
+  row.querySelector('.c-ops').onclick = (e) => {
+    const act = e.target.closest('button')?.dataset.act;
+    if (!act) return;
+    if (act === 'up') mMove(i, i - 1);
+    else if (act === 'down') mMove(i, i + 1);
+    else if (act === 'split') {
+      c.breakAfter = !c.breakAfter;
+      mRender();
+      mSchedulePlan();
+    } else if (act === 'rm') {
+      mstate.clips.splice(i, 1);
+      mRender();
+      mSchedulePlan();
+    }
+  };
+  list.appendChild(row);
+}
+
+function mRender() {
+  const list = $('mList');
+  list.innerHTML = '';
+  $('mEmpty').hidden = mstate.clips.length > 0;
+  const tasks = mSplitTasks();
+  const multi = tasks.length > 1;
+  $('mGroupHint').hidden = mstate.clips.length < 2;
+  let idx = 0;
+  tasks.forEach((group, gi) => {
+    if (multi) {
+      const head = document.createElement('div');
+      head.className = 'mtask-head';
+      const dur = group.reduce((s, c) => s + (c.dur || 0), 0);
+      const auto = mstate.suggestedList?.[gi];
+      const custom = group[0]?.outName || '';
+      // The product name is decided before the run, not after: with sources
+      // going to the trash, this name is the only trace left, so it has to be
+      // visible (and fixable) while there is still time.
+      const shownName = custom || (auto ? mBaseOf(auto) : '');
+      head.innerHTML = `<span class="mtask-no">任务 ${gi + 1}</span>`
+        + `<span class="mtask-meta">${group.length} 段${dur ? ` · ${fmtDur(dur)}` : ''}</span>`
+        + `<span class="mtask-out${custom ? ' custom' : ''}" title="产物存到首个片段旁的 merged/ 目录，双击可改名">`
+        + `${esc(shownName || '…')}</span>`
+        + '<span class="mtask-line"></span>'
+        + (gi > 0 ? '<button type="button" class="mtask-join" title="把本任务并回上一个任务">并回上一任务</button>' : '');
+      const outEl = head.querySelector('.mtask-out');
+      outEl.ondblclick = () => {
+        const cur = custom || shownName;
+        const next = prompt(`任务 ${gi + 1} 的产物文件名（留空恢复自动命名）`, cur);
+        if (next === null) return;
+        const v = next.trim();
+        group[0].outName = v ? (/\.\w{2,5}$/.test(v) ? v : `${v}.${mstate.plans?.[gi]?.outExt || 'mp4'}`) : '';
+        mRender();
+      };
+      const join = head.querySelector('.mtask-join');
+      if (join) {
+        // Capture the boundary now: `idx` is a loop variable and reading it
+        // inside the handler would see its final value, merging the wrong pair.
+        const boundary = idx - 1;
+        join.onclick = () => {
+          if (mstate.clips[boundary]) mstate.clips[boundary].breakAfter = false;
+          mRender();
+          mSchedulePlan();
+        };
+      }
+      list.appendChild(head);
+    }
+    group.forEach((c) => mRenderRow(c, idx++, list, idx < mstate.clips.length));
+  });
+  mUpdateMergeMeta();
+}
+
+function mMove(from, to) {
+  if (to < 0 || to >= mstate.clips.length || from === to) return;
+  const [it] = mstate.clips.splice(from, 1);
+  mstate.clips.splice(to, 0, it);
+  mRender();
+  mSchedulePlan();
+}
+
+function mUpdateMergeMeta() {
+  const n = mstate.clips.length;
+  const tasks = mSplitTasks();
+  const multi = tasks.length > 1;
+  const total = mstate.clips.reduce((s, c) => s + (c.dur || 0), 0);
+  const bytes = mstate.clips.reduce((s, c) => s + (c.size || 0), 0);
+  const parts = [`<span>共 <b>${n}</b> 段</span>`];
+  if (multi) parts.push(`<span>分 <b>${tasks.length}</b> 个任务</span>`);
+  if (total) parts.push(`<span>总时长 <b>${fmtDur(total)}</b></span>`);
+  if (bytes) parts.push(`<span>总大小 <b>${fmtSize(bytes)}</b></span>`);
+
+  const plans = mstate.plans || [];
+  if (plans.length === 1 && plans[0]?.ok) {
+    const p = plans[0];
+    const label = { copy: '无损拼接', remux: '重封装拼接', encode: p.copyVideo ? '仅重编码音频' : '需要重编码' }[p.strategy];
+    parts.push(`<span class="${p.strategy === 'copy' ? 'ok' : 'warn'}"><b>${label}</b></span>`);
+  } else if (plans.length === 1 && plans[0] && !plans[0].ok) {
+    parts.push('<span class="bad"><b>规格不一致</b></span>');
+  } else if (multi && plans.length === tasks.length) {
+    const copy = plans.filter((p) => p?.strategy === 'copy').length;
+    const bad = plans.filter((p) => p && !p.ok).length;
+    parts.push(`<span class="${copy === plans.length ? 'ok' : 'warn'}"><b>${copy}/${plans.length}</b> 任务可无损</span>`);
+    if (bad) parts.push(`<span class="bad"><b>${bad} 个任务无法合并</b></span>`);
+  }
+
+  const badGroups = tasks.filter((t) => t.length < 2).length;
+  if (badGroups) parts.push(`<span class="bad"><b>${badGroups} 个任务只有 1 段</b></span>`);
+  if ($('mDeleteSources').checked && n >= 2) parts.push('<span class="bad"><b>成功后移入废纸篓</b></span>');
+
+  $('mCounts').innerHTML = parts.join('');
+  $('mStart').disabled = n < 2 || mstate.running || badGroups > 0;
+  $('mClear').disabled = !n || mstate.running;
+  $('mStart').textContent = !n ? '开始合并'
+    : multi ? `开始合并 ${tasks.length} 个任务`
+      : `开始合并 ${n} 个片段`;
+  // A single output path cannot describe several products, so multi-task runs
+  // always auto-name beside each task's first clip.
+  $('mOutput').disabled = multi || mstate.running;
+  $('mOutput').title = multi ? '多任务时各自存到首个片段旁的 merged/ 目录，双击任务标题可改名' : '';
+  $('mPickOutput').disabled = multi || mstate.running;
+  $('mClearOutput').disabled = multi || mstate.running;
+}
+
+// Probing N clips is cheap but not free; debounce so drag-reordering a long
+// list does not fire one analysis per move.
+function mSchedulePlan() {
+  clearTimeout(mstate.planTimer);
+  mstate.plans = [];
+  mstate.plan = null;
+  mstate.planTimer = setTimeout(mRefreshPlan, 450);
+}
+
+// Each task is planned independently: a group of 4K clips and a group of 720p
+// clips should not be forced onto a shared target just because they share a
+// list. Requests run sequentially so a 50-task list does not flood ffprobe.
+async function mRefreshPlan() {
+  if (mstate.running) return;
+  const tasks = mSplitTasks();
+  if (!tasks.length) { mstate.plans = []; mstate.plan = null; mRender(); return; }
+  const seq = ++mstate.planSeq;
+  for (const c of mstate.clips) c.action = undefined;
+  mRender();
+  const plans = [];
+  const suggestions = [];
+  try {
+    for (let gi = 0; gi < tasks.length; gi++) {
+      const task = tasks[gi];
+      if (seq !== mstate.planSeq) return;
+      const r = await fetch('/api/merge-plan', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          files: task.map((c) => c.path),
+          mode: $('mMode').value, size: $('mSize').value, quality: $('mQuality').value,
+          index: gi, total: tasks.length,
+        }),
+      });
+      const d = await r.json();
+      if (seq !== mstate.planSeq) return;
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      const byPath = new Map((d.clips || []).map((c) => [c.file, c]));
+      for (const c of task) {
+        const info = byPath.get(c.path);
+        if (!info) continue;
+        c.error = info.ok ? null : (info.error || '无法解析');
+        c.dur = info.duration || 0;
+        c.info = info.ok ? info : null;
+        if (info.size) c.size = info.size;
+        c.action = clipActionOf(info, d.plan);
+      }
+      plans.push(d.plan);
+      suggestions[gi] = d.suggestedOutput || '';
+      if (tasks.length === 1) {
+        mstate.suggested = d.suggestedOutput || '';
+        if (!$('mOutput').value) {
+          $('mOutput').placeholder = d.suggestedOutput
+            ? `自动：merged/${mBaseOf(d.suggestedOutput)}`
+            : '自动：首个片段旁的 merged/ 目录';
+        }
+      }
+    }
+    mstate.plans = plans;
+    mstate.suggestedList = suggestions;
+    mstate.plan = plans.length === 1 ? plans[0] : null;
+  } catch (e) {
+    if (seq === mstate.planSeq) toast(`分析片段失败：${e}`, 'bad');
+  }
+  mRender();
+}
+
+async function mLoadPaths(paths) {
+  let added = 0, results = [];
+  const all = [];
+  try {
+    const r = await fetch('/api/scan-many', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+    for (let i = 0; i < paths.length; i++) {
+      const rr = d.results?.[i];
+      if (rr?.ok) {
+        for (const f of (rr.files || [])) all.push(f);
+        results.push({ ok: true, count: rr.count });
+      } else {
+        results.push({ ok: false, error: rr?.error || '无扫描结果' });
+      }
+    }
+    added = mAppendFiles(all);
+    if (added) { mRender(); mSchedulePlan(); }
+  } catch (e) {
+    toast(`载入失败：${e}`, 'bad');
+  }
+  return { added, results };
+}
+
+async function mIntakeDataTransfer(dt) {
+  const files = [...dt.files].filter((f) => VIDEO_RE.test(f.name));
+  const entries = [...dt.items].map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
+  const hasDir = entries.some((e) => e.isDirectory);
+  if (!files.length && !hasDir) { toast('没有识别到视频文件', 'bad'); return; }
+  toast('正在打开原生选择器以获取真实路径…', '');
+  if (hasDir) {
+    const d = await fetch('/api/pick-folder', { method: 'POST' }).then((r) => r.json()).catch(() => null);
+    if (d?.ok) {
+      const { added } = await mLoadPaths([d.path]);
+      toast(added ? `已加入 ${added} 个片段` : '没有新增片段', added ? 'ok' : '');
+    } else if (d && !d.cancelled) toast(d.error || '选择失败', 'bad');
+  } else {
+    const d = await fetch('/api/pick-file', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ multiple: true }),
+    }).then((r) => r.json()).catch(() => null);
+    if (d?.ok) {
+      if (!d.paths.length) toast('所选文件中没有视频', 'bad');
+      else {
+        const { added } = await mLoadPaths(d.paths);
+        toast(added ? `已加入 ${added} 个片段` : '没有新增片段', added ? 'ok' : '');
+      }
+    } else if (d && !d.cancelled) toast(d.error || '选择失败', 'bad');
+  }
+}
+
+function mSetRunning(on) {
+  mstate.running = on;
+  $('mStop').hidden = !on;
+  $('mMode').disabled = on; $('mSize').disabled = on; $('mQuality').disabled = on;
+  $('mDeleteSources').disabled = on;
+  $('mPathGo').disabled = on || !parsePaths($('mPathInput').value).length;
+  mUpdateMergeMeta();
+  mRender();
+}
+
+// One result row per task. "需复核" means the merge itself produced a file but
+// the product failed verification, so the sources were deliberately kept.
+function showQueueResult(sum) {
+  const box = $('mResult');
+  const tasks = sum.tasks || [];
+  const hasFail = sum.failed > 0 || sum.notRun > 0;
+  const hasIssue = hasFail || sum.partial > 0 || sum.trashErrorCount > 0;
+  box.hidden = false;
+  box.classList.toggle('bad', hasFail);
+  box.classList.toggle('warn', hasIssue && !hasFail);
+  $('mResultIcon').textContent = hasFail ? '✕' : hasIssue ? '!' : '✓';
+  $('mResultTitle').textContent = hasFail ? '队列未完成，有任务失败' : hasIssue ? '队列完成，部分需复核' : '全部任务完成';
+
+  const bits = [`${sum.total} 个任务`];
+  if (sum.succeeded) bits.push(`${sum.succeeded} 成功`);
+  if (sum.partial) bits.push(`${sum.partial} 需复核`);
+  if (sum.failed) bits.push(`${sum.failed} 失败`);
+  if (sum.notRun) bits.push(`${sum.notRun} 未执行`);
+  if (sum.deletedCount) bits.push(`已移入废纸篓 ${sum.deletedCount} 个源文件`);
+  if (sum.keptCount) bits.push(`保留 ${sum.keptCount} 个源文件`);
+  if (sum.trashErrorCount) bits.push(`删除失败 ${sum.trashErrorCount} 个`);
+  $('mResultSub').textContent = bits.join(' · ');
+
+  const firstOut = tasks.find((t) => t.output);
+  $('mResultPath').textContent = tasks.length === 1 && firstOut ? firstOut.output : '';
+  $('mResultPath').hidden = !(tasks.length === 1 && firstOut);
+
+  const tl = $('mTaskList');
+  tl.hidden = !tasks.length;
+  tl.innerHTML = tasks.map((t) => {
+    const state = t.trashErrors?.length ? 'part'
+      : t.ok && (t.verified || !sum.deleteSources) ? 'ok' : (t.ok ? 'part' : 'bad');
+    const icon = state === 'ok' ? '✓' : state === 'part' ? '!' : '✕';
+    const label = state === 'ok' ? '成功' : state === 'part' ? '需复核' : '失败';
+    const det = [];
+    if (t.output) {
+      if (t.duration) det.push(fmtDur(t.duration));
+      if (t.size) det.push(fmtSize(t.size));
+    }
+    if (t.deleted?.length) det.push(`已移入废纸篓 ${t.deleted.length} 个`);
+    if (t.kept?.length) det.push(`保留 ${t.kept.length} 个源文件`);
+    if (t.trashErrors?.length) det.push(`删除失败 ${t.trashErrors.length} 个：${t.trashErrors[0].reason}`);
+    const why = t.verifiedReason || (t.reasons || [])[0];
+    if (why && state !== 'ok') det.push(why);
+    return `<div class="mt-row ${state}">`
+      + `<span class="mt-icon">${icon}</span>`
+      + `<span class="mt-no">任务 ${t.index + 1}</span>`
+      + `<span class="mt-label">${label}</span>`
+      + `<span class="mt-detail" title="${esc(det.join(' · '))}">${esc(det.join(' · ') || '—')}</span>`
+      + '</div>';
+  }).join('');
+
+  const trashErrs = tasks.flatMap((t) => (t.trashErrors || []).map((e) => ({ ...e, task: t.index + 1 })));
+  const failedPaths = new Set(trashErrs.map((e) => e.file));
+  const kept = (tasks.flatMap((t) => (t.kept || []))).filter((p) => !failedPaths.has(p));
+  const w = $('mResultWarn');
+  w.hidden = !trashErrs.length && !kept.length;
+  if (!w.hidden) {
+    const parts = [];
+    if (trashErrs.length) {
+      parts.push(`<div>以下 ${trashErrs.length} 个源文件移入废纸篓失败，已原样保留：</div>`);
+      for (const e of trashErrs.slice(0, 40)) {
+        parts.push(`<div class="mw-path">任务 ${e.task} · ${esc(e.file)}<span class="mw-why">${esc(e.reason)}</span></div>`);
+      }
+      if (trashErrs.length > 40) parts.push(`<div>… 另有 ${trashErrs.length - 40} 个</div>`);
+    }
+    if (kept.length) {
+      parts.push(`<div>以下 ${kept.length} 个源文件因所在任务未通过校验而保留，未做任何改动：</div>`);
+      parts.push(...kept.slice(0, 40).map((p) => `<div class="mw-path">${esc(p)}</div>`));
+      if (kept.length > 40) parts.push(`<div>… 另有 ${kept.length - 40} 个</div>`);
+    }
+    w.innerHTML = parts.join('');
+  }
+
+  box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function mStart() {
+  if (mstate.running) return;
+  const tasks = mSplitTasks();
+  if (!tasks.length) return;
+
+  const badIdx = tasks.findIndex((t) => t.length < 2);
+  if (badIdx >= 0) {
+    toast(`任务 ${badIdx + 1} 只有 1 段，请先并回相邻任务或补充片段`, 'bad');
+    return;
+  }
+  const usable = tasks.map((t) => t.filter((c) => !c.error));
+  if (usable.some((t) => t.length < 2)) {
+    toast('有任务的可用片段不足 2 个，请先移除无法解析的文件', 'bad');
+    return;
+  }
+  const badPlan = (mstate.plans || []).find((p) => p && !p.ok);
+  if (badPlan) { toast(badPlan.reasons?.[0] || '有任务在当前设置下无法合并', 'bad'); return; }
+
+  const single = tasks.length === 1;
+  const doDelete = $('mDeleteSources').checked;
+  // The manual save path used to be shown in this dialog but never sent to the
+  // server, so a hand-picked location was silently ignored. Send it now.
+  const manual = single ? $('mOutput').value.trim() : '';
+  const totalDur = mstate.clips.reduce((s, c) => s + (c.dur || 0), 0);
+  const skipCount = mstate.clips.length - usable.flat().length;
+
+  const p = mstate.plans?.[0];
+  const strat = p?.ok
+    ? { copy: '无损拼接', remux: '重封装无损', encode: p.copyVideo ? '仅重编码音频' : '统一规格重编码' }[p.strategy]
+    : '自动选择';
+  const stats = single
+    ? [
+        { label: '片段', value: String(mstate.clips.length) },
+        { label: '预计时长', value: fmtDur(totalDur) || '—' },
+        { label: '方式', value: strat, small: true },
+      ]
+    : [
+        { label: '任务', value: String(tasks.length) },
+        { label: '片段', value: String(mstate.clips.length) },
+        { label: '预计时长', value: fmtDur(totalDur) || '—' },
+      ];
+  const rows = single
+    ? [{ label: '输出文件', value: manual || mstate.suggested || '首个片段旁的 merged/ 目录（自动命名）' }]
+    : [{ label: '输出文件', value: '各自存到该任务首个片段旁的 merged/ 目录，命名如 <首段名>_merged_t01.mp4' }];
+  const warn = doDelete
+    ? (skipCount
+        ? `合并成功后将把源文件移入废纸篓（可还原）。仅零告警且校验通过的任务会删，否则整组保留。<br>注意：有 <b>${skipCount}</b> 个片段无法解析，所在任务会整组保留源文件。`
+        : '合并成功后将把源文件移入废纸篓（可还原）。仅零告警且校验通过的任务会删，否则整组保留。')
+    : '';
+  const ok = await askConfirm({
+    title: single ? '确认合并' : `确认合并 ${tasks.length} 个任务`,
+    subtitle: single
+      ? `${mstate.clips.length} 个片段将按顺序拼接为 1 个文件`
+      : `${mstate.clips.length} 个片段分成 ${tasks.length} 组，各组独立合并成一个文件`,
+    icon: 'merge', tone: 'info',
+    stats, rows, warn,
+    lines: doDelete ? [] : ['源文件不会被删除。'],
+    confirmText: single ? '开始合并' : `开始合并 ${tasks.length} 个任务`,
+  });
+  if (!ok) return;
+
+  mstate.stopFlag = false;
+  mstate.logs = [];
+  mstate.summary = null;
+  $('mResult').hidden = true;
+  $('mTaskList').hidden = true;
+  const panel = $('mStatusPanel');
+  panel.hidden = false;
+  panel.classList.remove('done', 'warn', 'bad');
+  $('mStatusTitle').textContent = single ? '正在合并' : `正在合并任务 1 / ${tasks.length}`;
+  $('mStatusCounts').textContent = single ? `${mstate.clips.length} 个片段` : `0 / ${tasks.length} 个任务`;
+  $('mCurClip').textContent = '准备中…';
+  $('mCurIndex').textContent = '';
+  $('mCurStage').textContent = '分析片段…';
+  $('mCurMetrics').textContent = '';
+  $('mBar').classList.add('indeterminate');
+  $('mBar').style.width = '';
+  $('mBarTotal').style.width = '0%';
+  $('mPercent').textContent = '0%';
+  $('mElapsed').textContent = '00:00';
+  const t0 = Date.now();
+  clearInterval(mstate.timer);
+  mstate.timer = setInterval(() => { $('mElapsed').textContent = fmtClock(Date.now() - t0); }, 500);
+  mSetRunning(true);
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  const ctrl = new AbortController();
+  mstate.abort = ctrl;
+  let summary = null;
+  let doneTasks = 0;
+  try {
+    const res = await fetch('/api/merge-queue', {
+      method: 'POST', signal: ctrl.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tasks: tasks.map((t, i) => {
+          const output = (manual && i === 0) ? manual : mTaskOutput(t);
+          const files = t.map((c) => c.path);
+          return output ? { files, output } : { files };
+        }),
+        mode: $('mMode').value, size: $('mSize').value, quality: $('mQuality').value,
+        deleteSources: doDelete,
+      }),
+    });
+    if (!res.ok) throw new Error(`服务端错误 ${res.status}`);
+    await readSSE(res, (ev, d) => {
+      if (ev === 'queue-start') {
+        $('mCurStage').textContent = `共 ${d.total} 个任务，准备中…`;
+      } else if (ev === 'task-start') {
+        $('mStatusTitle').textContent = `正在合并任务 ${d.index + 1} / ${d.total}`;
+        $('mStatusCounts').textContent = `${doneTasks} / ${d.total} 个任务已完成`;
+        $('mCurClip').textContent = d.names?.[0] || '—';
+        $('mCurIndex').textContent = `1 / ${d.names?.length || 0}`;
+        $('mCurStage').textContent = '分析片段…';
+        $('mCurMetrics').textContent = '';
+        $('mBar').classList.add('indeterminate');
+        $('mBar').style.width = '';
+      } else if (ev === 'clips') {
+        const task = tasks[d.index];
+        if (task) {
+          const byPath = new Map((d.clips || []).map((c) => [c.file, c]));
+          for (const c of task) {
+            const info = byPath.get(c.path);
+            if (!info) continue;
+            c.error = info.ok ? null : (info.error || '无法解析');
+            c.info = info.ok ? info : null;
+            if (info.duration) c.dur = info.duration;
+          }
+          mRender();
+        }
+      } else if (ev === 'task-progress') {
+        $('mCurStage').textContent = d.stage || '合并中…';
+        if (d.clipName) $('mCurClip').textContent = d.clipName;
+        const task = tasks[d.index];
+        if (d.clipIndex != null && task) $('mCurIndex').textContent = `${d.clipIndex + 1} / ${task.length}`;
+        if (d.percent != null) {
+          const pct = Math.max(0, Math.min(100, d.percent));
+          const overall = ((d.index + pct / 100) / tasks.length) * 100;
+          $('mBar').classList.remove('indeterminate');
+          $('mBar').style.width = `${pct}%`;
+          $('mBarTotal').style.width = `${overall}%`;
+          $('mPercent').textContent = `${overall.toFixed(0)}%`;
+        }
+        const bits = [];
+        if (d.speed && d.speed !== 'N/A') bits.push(d.speed);
+        if (d.outTime) bits.push(fmtDur(d.outTime));
+        $('mCurMetrics').textContent = bits.join(' · ');
+      } else if (ev === 'task-done') {
+        doneTasks = d.index + 1;
+        $('mStatusCounts').textContent = `${doneTasks} / ${tasks.length} 个任务已完成`;
+        $('mBarTotal').style.width = `${(doneTasks / tasks.length) * 100}%`;
+        $('mPercent').textContent = `${((doneTasks / tasks.length) * 100).toFixed(0)}%`;
+      } else if (ev === 'log') {
+        mstate.logs.push(d.message);
+      } else if (ev === 'queue-done') {
+        summary = d;
+      }
+    });
+  } catch (e) {
+    if (e.name !== 'AbortError') toast(`合并出错：${e}`, 'bad');
+  } finally {
+    clearInterval(mstate.timer);
+    mstate.timer = null;
+    mstate.abort = null;
+    mSetRunning(false);
+    $('mBar').classList.remove('indeterminate');
+    $('mElapsed').textContent = fmtClock(Date.now() - t0);
+
+    if (summary) {
+      mstate.summary = summary;
+      const clean = summary.failed === 0 && summary.partial === 0 && summary.notRun === 0;
+      $('mBar').style.width = '100%';
+      $('mBarTotal').style.width = '100%';
+      $('mPercent').textContent = '100%';
+      panel.classList.add(clean ? 'done' : 'warn');
+      $('mStatusTitle').textContent = clean ? '队列完成' : '队列完成（部分需处理）';
+      $('mCurStage').textContent = '全部任务已跑完';
+      $('mCurMetrics').textContent = '';
+      const firstOut = (summary.tasks || []).find((t) => t.output);
+      if (firstOut) mstate.lastOutput = firstOut.output;
+      showQueueResult(summary);
+      const tail = summary.deletedCount ? ` · 已移入废纸篓 ${summary.deletedCount} 个源文件` : '';
+      toast(`${summary.succeeded} 成功${summary.failed ? ` / ${summary.failed} 失败` : ''}${tail}`, clean ? 'ok' : 'bad');
+    } else {
+      const stopped = mstate.stopFlag;
+      panel.classList.add(stopped ? 'warn' : 'bad');
+      $('mStatusTitle').textContent = stopped ? '已停止' : '队列异常中断';
+      $('mCurStage').textContent = stopped ? '已停止，未完成的任务不会留下半成品' : '未拿到队列结果，请查看日志';
+      toast(stopped ? '已停止' : '队列异常中断', 'bad');
+    }
+    mRender();
+  }
+}
+
+
+// ---------- merge intake wiring ----------
+const mDrop = $('mDrop');
+['dragenter', 'dragover'].forEach((ev) => mDrop.addEventListener(ev, (e) => { e.preventDefault(); mDrop.classList.add('over'); }));
+['dragleave', 'drop'].forEach((ev) => mDrop.addEventListener(ev, (e) => {
+  e.preventDefault();
+  if (ev === 'dragleave' && mDrop.contains(e.relatedTarget)) return;
+  mDrop.classList.remove('over');
+}));
+mDrop.addEventListener('drop', async (e) => { e.preventDefault(); await mIntakeDataTransfer(e.dataTransfer); });
+mDrop.addEventListener('click', (e) => {
+  if (e.target === mDrop || (e.target.closest('.drop-inner') && !e.target.closest('button,input,textarea,.paste-box'))) mPickFiles();
+});
+mDrop.addEventListener('keydown', (e) => {
+  if (e.target.closest('input,textarea,button,select')) return;
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); mPickFiles(); }
+});
+
+async function mPickFiles() {
+  const d = await fetch('/api/pick-file', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ multiple: true }),
+  }).then((r) => r.json()).catch(() => null);
+  if (d?.ok) {
+    if (!d.paths.length) toast('所选文件中没有视频', 'bad');
+    else {
+      const { added } = await mLoadPaths(d.paths);
+      toast(added ? `已加入 ${added} 个片段` : '没有新增片段', added ? 'ok' : '');
+    }
+  } else if (d && !d.cancelled) toast(d.error || '选择失败', 'bad');
+}
+
+$('mPickFiles').onclick = (e) => { e.stopPropagation(); mPickFiles(); };
+$('mPickFolder').onclick = async (e) => {
+  e.stopPropagation();
+  const d = await fetch('/api/pick-folder', { method: 'POST' }).then((r) => r.json()).catch(() => null);
+  if (d?.ok) {
+    const { added } = await mLoadPaths([d.path]);
+    toast(added ? `已按文件名顺序加入 ${added} 个片段` : '该文件夹没有新的视频', added ? 'ok' : '');
+  } else if (d && !d.cancelled) toast(d.error || '选择失败', 'bad');
+};
+$('mPathGo').onclick = async (e) => {
+  e.stopPropagation();
+  const paths = parsePaths($('mPathInput').value);
+  if (!paths.length) { toast('请先粘贴至少一个路径', ''); return; }
+  const go = $('mPathGo');
+  go.disabled = true; go.textContent = '载入中…';
+  $('mPasteBox').classList.add('loading');
+  const { added } = await mLoadPaths(paths);
+  $('mPasteBox').classList.remove('loading');
+  go.textContent = '载入';
+  if (added) toast(`已加入 ${added} 个片段`, 'ok');
+  else toast('没有新增片段', 'bad');
+  mUpdateMergePaste();
+};
+$('mPathInput').onclick = (e) => e.stopPropagation();
+$('mPathInput').oninput = () => mUpdateMergePaste();
+$('mPathInput').onkeydown = (e) => {
+  e.stopPropagation();
+  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); $('mPathGo').click(); }
+};
+$('mPasteClear').onclick = (e) => { e.stopPropagation(); $('mPathInput').value = ''; mUpdateMergePaste(); };
+
+function mUpdateMergePaste() {
+  const n = parsePaths($('mPathInput').value).length;
+  const c = $('mPasteCount');
+  c.textContent = n ? `${n} 个路径` : '';
+  c.classList.toggle('on', n > 0);
+  $('mPathGo').disabled = !n || mstate.running;
+  $('mPathGo').textContent = n > 1 ? `载入 ${n} 个` : '载入';
+  const ta = $('mPathInput');
+  ta.style.height = 'auto';
+  ta.style.height = `${Math.min(Math.max(ta.scrollHeight, 46), 176)}px`;
+}
+
+$('mPickOutput').onclick = async (e) => {
+  e.stopPropagation();
+  const first = mstate.clips.find((c) => !c.error);
+  const base = first ? first.name.replace(/\.[^.]+$/, '') : 'merged';
+  const ext = mstate.plan?.outExt || mstate.plans?.[0]?.outExt || 'mp4';
+  const d = await fetch('/api/pick-save', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ defaultName: `${base}_merged.${ext}` }),
+  }).then((r) => r.json()).catch(() => null);
+  if (d?.ok && d.path) { $('mOutput').value = d.path; toast('输出位置已设置', 'ok'); }
+  else if (d && !d.cancelled) toast(d.error || '选择失败', 'bad');
+};
+$('mClearOutput').onclick = (e) => { e.stopPropagation(); $('mOutput').value = ''; };
+$('mStart').onclick = mStart;
+$('mClear').onclick = () => {
+  if (mstate.running) return;
+  mstate.clips = []; mstate.plan = null; mstate.plans = []; mstate.suggested = '';
+  mstate.suggestedList = []; mstate.summary = null;
+  $('mResult').hidden = true;
+  $('mTaskList').hidden = true;
+  $('mStatusPanel').hidden = true;
+  mRender();
+};
+$('mStop').onclick = () => { mstate.stopFlag = true; mstate.abort?.abort(); toast('正在停止…', ''); };
+$('mReveal').onclick = async () => {
+  if (!mstate.lastOutput) return;
+  const r = await fetch('/api/reveal', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: mstate.lastOutput }),
+  }).then((x) => x.json()).catch(() => null);
+  if (!r?.ok) toast('无法在 Finder 中显示（可能只支持 macOS）', 'bad');
+};
+
+for (const id of ['mMode', 'mSize', 'mQuality']) $(id).onchange = () => mSchedulePlan();
+$('mDeleteSources').onchange = () => {
+  mUpdateMergeMeta();
+  if ($('mDeleteSources').checked) {
+    toast('已开启：仅在零告警且时长校验通过时，把源文件移入废纸篓', '');
+  }
+};
+
+// Drag to reorder. Moving down lands after the target, moving up lands before
+// it — which is exactly what splice(from,1) + splice(to,0,item) does.
+$('mList').addEventListener('dragstart', (e) => {
+  const row = e.target.closest('.mrow');
+  if (!row) return;
+  mstate.drag = Number(row.dataset.i);
+  row.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+  try { e.dataTransfer.setData('text/plain', row.dataset.i); } catch { /* Safari */ }
+});
+$('mList').addEventListener('dragend', () => {
+  mstate.drag = -1;
+  for (const r of document.querySelectorAll('.mrow')) r.classList.remove('dragging', 'drop-before', 'drop-after');
+});
+$('mList').addEventListener('dragover', (e) => {
+  if (mstate.drag < 0) return;
+  e.preventDefault();
+  const row = e.target.closest('.mrow');
+  if (!row) return;
+  for (const r of document.querySelectorAll('.mrow')) r.classList.remove('drop-before', 'drop-after');
+  row.classList.add(Number(row.dataset.i) < mstate.drag ? 'drop-before' : 'drop-after');
+});
+$('mList').addEventListener('drop', (e) => {
+  if (mstate.drag < 0) return;
+  e.preventDefault();
+  const row = e.target.closest('.mrow');
+  const from = mstate.drag;
+  mstate.drag = -1;
+  for (const r of document.querySelectorAll('.mrow')) r.classList.remove('dragging', 'drop-before', 'drop-after');
+  if (!row) return;
+  mMove(from, Number(row.dataset.i));
+});
+
+mUpdateMergePaste();
+mRender();
+if (location.hash === '#merge') switchView('merge', { hash: false });
