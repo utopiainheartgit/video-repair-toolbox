@@ -576,18 +576,39 @@ input[type=text] { min-width: 0; }
   background: #18233a; border: 1px solid #33496d; border-radius: 4px; padding: 1px 4px;
 }
 
+.mtask-card { border-top: 1px solid #2b313d; }
+.mtask-card:first-child { border-top: none; }
+.mtask-card.dragging { opacity: .4; }
+.mtask-card.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
+.mtask-card.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
 .mtask-head {
   display: flex; align-items: center; gap: 10px;
-  padding: 13px 14px 7px; border-top: 1px solid #2b313d;
+  padding: 12px 14px; cursor: pointer; user-select: none;
   background: linear-gradient(180deg, #1a1f28, #171b22);
 }
-.mtask-head:first-child { border-top: none; }
+.mtask-head:hover { background: linear-gradient(180deg, #1e232d, #1a1f28); }
+.mtask-grip { font-size: 14px; color: #4a5464; cursor: grab; line-height: 1; }
+.mtask-card.dragging .mtask-grip { cursor: grabbing; }
+.mtask-toggle {
+  width: 20px; height: 20px; flex: none; padding: 0; border: none;
+  background: transparent; color: var(--dim); font-size: 12px; cursor: pointer;
+  font-family: inherit;
+}
+.mtask-toggle:hover { color: var(--fg); }
 .mtask-no {
   font-size: 11.5px; font-weight: 700; letter-spacing: .3px;
   color: #9dc0f5; background: #16202f; border: 1px solid #2b4368;
   padding: 2px 8px; border-radius: 20px; white-space: nowrap;
 }
-.mtask-meta { font-size: 11.5px; color: var(--dim2); white-space: nowrap; }
+.mtask-summary { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.mtask-first {
+  font-size: 13px; color: var(--fg); font-weight: 500;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mtask-sub { font-size: 11.5px; color: var(--dim2); white-space: nowrap; }
+.mtask-plan { flex: none; }
+.mtask-body { border-top: 1px solid #21252e; }
+.mtask-body .mrow:first-child { border-top: none; }
 .mtask-out {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
   color: #aab5c6; background: #12161d; border: 1px solid #333b49;

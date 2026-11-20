@@ -958,7 +958,8 @@ const mstate = {
   clips: [], running: false, abort: null, stopFlag: false,
   plan: null, plans: [], suggested: '', suggestedList: [], lastOutput: '', logs: [],
   summary: null, session: null,
-  drag: -1, planTimer: null, planSeq: 0, timer: null,
+  drag: -1, dragTask: -1, mExpanded: new Set(),
+  planTimer: null, planSeq: 0, timer: null,
 };
 
 function switchView(view, { hash = true } = {}) {
@@ -1098,6 +1099,16 @@ function mRenderRow(c, i, list, canSplit) {
   list.appendChild(row);
 }
 
+// One badge summarising how a whole task will be merged, shown on its card.
+function mTaskPlanTag(gi) {
+  const p = mstate.plans?.[gi];
+  if (!p) return '<span class="mtag none">分析中…</span>';
+  if (!p.ok) return '<span class="mtag skip">规格不一致</span>';
+  const label = { copy: '无损拼接', remux: '重封装', encode: p.copyVideo ? '仅修音频' : '重编码' }[p.strategy] || p.strategy;
+  const cls = (p.strategy === 'encode' && p.copyVideo) ? 'audio' : p.strategy;
+  return `<span class="mtag ${cls}">${label}</span>`;
+}
+
 function mRender() {
   const list = $('mList');
   list.innerHTML = '';
@@ -1107,57 +1118,102 @@ function mRender() {
   $('mGroupHint').hidden = mstate.clips.length < 2;
   let idx = 0;
   tasks.forEach((group, gi) => {
-    if (multi) {
-      const head = document.createElement('div');
-      head.className = 'mtask-head';
-      const dur = group.reduce((s, c) => s + (c.dur || 0), 0);
-      const auto = mstate.suggestedList?.[gi];
-      const custom = group[0]?.outName || '';
-      // The product name is decided before the run, not after: with sources
-      // going to the trash, this name is the only trace left, so it has to be
-      // visible (and fixable) while there is still time.
-      const shownName = custom || (auto ? mBaseOf(auto) : '');
-      const outPlaceholder = auto ? `默认 ${mBaseOf(auto)}` : '自动命名';
-      head.innerHTML = `<span class="mtask-no">任务 ${gi + 1}</span>`
-        + `<span class="mtask-meta">${group.length} 段${dur ? ` · ${fmtDur(dur)}` : ''}</span>`
-        + `<input type="text" class="mtask-out${custom ? ' custom' : ''}" spellcheck="false" `
-        + `value="${esc(custom)}" placeholder="${esc(outPlaceholder)}" `
-        + `title="产物文件名：可填名称或路径，留空用默认。默认存到首个片段所在文件夹">`
-        + '<span class="mtask-line"></span>'
-        + (gi > 0 ? '<button type="button" class="mtask-join" title="把本任务并回上一个任务">并回上一任务</button>' : '');
-      // Editable output name. Use `change` (fires on blur / Enter) instead of
-      // `input`, and never re-render on each keystroke — that would destroy the
-      // field mid-typing and lose focus. Normalise on commit only.
-      const outEl = head.querySelector('.mtask-out');
-      outEl.onchange = () => {
-        const v = outEl.value.trim();
-        // A bare name is normalised for display; a path (absolute or relative)
-        // is passed through so the server can resolve it. Either way the final
-        // extension is the plan's — a typed suffix is never kept.
-        if (!v) group[0].outName = '';
-        else if (v.includes('/') || v.includes('\\')) group[0].outName = v;
-        else group[0].outName = mNormOutName(v, mstate.plans?.[gi]?.outExt || 'mp4');
-        outEl.value = group[0].outName;
-        outEl.classList.toggle('custom', !!group[0].outName);
-        outEl.placeholder = group[0].outName ? outPlaceholder : (auto ? `默认 ${mBaseOf(auto)}` : '自动命名');
-      };
-      outEl.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); outEl.blur(); } };
-      const join = head.querySelector('.mtask-join');
-      if (join) {
-        // Capture the boundary now: `idx` is a loop variable and reading it
-        // inside the handler would see its final value, merging the wrong pair.
-        const boundary = idx - 1;
-        join.onclick = () => {
-          if (mstate.clips[boundary]) mstate.clips[boundary].breakAfter = false;
-          mRender();
-          mSchedulePlan();
-        };
-      }
-      list.appendChild(head);
+    if (!multi) {
+      group.forEach((c) => mRenderRow(c, idx++, list, idx < mstate.clips.length));
+      return;
     }
-    group.forEach((c) => mRenderRow(c, idx++, list, idx < mstate.clips.length));
+
+    // The card head stays visible; only its body (the clip rows) is collapsible.
+    // A task's identity is its first clip's path, so expansion survives reorders
+    // and plan refreshes. New tasks start collapsed.
+    const key = group[0].path;
+    const open = mstate.mExpanded.has(key);
+    const card = document.createElement('div');
+    card.className = 'mtask-card' + (open ? ' open' : '');
+    card.dataset.task = String(gi);
+
+    const head = document.createElement('div');
+    head.className = 'mtask-head';
+    head.draggable = true;
+    const dur = group.reduce((s, c) => s + (c.dur || 0), 0);
+    const bytes = group.reduce((s, c) => s + (c.size || 0), 0);
+    const auto = mstate.suggestedList?.[gi];
+    const custom = group[0]?.outName || '';
+    const outPlaceholder = auto ? `默认 ${mBaseOf(auto)}` : '自动命名';
+    const first = group[0];
+    const firstLabel = first.name + (group.length > 1 ? ` 等 ${group.length} 段` : '');
+    head.innerHTML = `<span class="mtask-grip" title="拖动整张卡调整任务顺序">⠿</span>`
+      + `<button type="button" class="mtask-toggle" title="${open ? '收起' : '展开'}该任务的片段">${open ? '▾' : '▸'}</button>`
+      + `<span class="mtask-no">任务 ${gi + 1}</span>`
+      + `<span class="mtask-summary"><span class="mtask-first" title="${esc(first.path)}">${esc(firstLabel)}</span>`
+      + `<span class="mtask-sub">${group.length} 段${dur ? ` · ${fmtDur(dur)}` : ''}${bytes ? ` · ${fmtSize(bytes)}` : ''}</span></span>`
+      + `<span class="mtask-plan">${mTaskPlanTag(gi)}</span>`
+      + `<input type="text" class="mtask-out${custom ? ' custom' : ''}" spellcheck="false" `
+      + `value="${esc(custom)}" placeholder="${esc(outPlaceholder)}" `
+      + `title="产物文件名：可填名称或路径，留空用默认。默认存到首个片段所在文件夹">`
+      + (gi > 0 ? '<button type="button" class="mtask-join" title="把本任务并回上一个任务">并回上一任务</button>' : '');
+
+    // Clicking the head (outside its controls) toggles the card.
+    const toggle = () => {
+      if (mstate.mExpanded.has(key)) mstate.mExpanded.delete(key);
+      else mstate.mExpanded.add(key);
+      mRender();
+    };
+    head.querySelector('.mtask-toggle').onclick = (e) => { e.stopPropagation(); toggle(); };
+    head.onclick = (e) => { if (!e.target.closest('input, button')) toggle(); };
+
+    // Editable output name. `change` fires on blur / Enter; never re-render on
+    // each keystroke. Keep the field's clicks from toggling the card.
+    const outEl = head.querySelector('.mtask-out');
+    outEl.onclick = (e) => e.stopPropagation();
+    outEl.onchange = () => {
+      const v = outEl.value.trim();
+      if (!v) group[0].outName = '';
+      else if (v.includes('/') || v.includes('\\')) group[0].outName = v;
+      else group[0].outName = mNormOutName(v, mstate.plans?.[gi]?.outExt || 'mp4');
+      outEl.value = group[0].outName;
+      outEl.classList.toggle('custom', !!group[0].outName);
+      outEl.placeholder = group[0].outName ? outPlaceholder : (auto ? `默认 ${mBaseOf(auto)}` : '自动命名');
+    };
+    outEl.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); outEl.blur(); } };
+
+    const join = head.querySelector('.mtask-join');
+    if (join) {
+      // Capture now: `idx` keeps changing as later groups render.
+      const boundary = idx - 1;
+      join.onclick = (e) => {
+        e.stopPropagation();
+        if (mstate.clips[boundary]) mstate.clips[boundary].breakAfter = false;
+        mRender();
+        mSchedulePlan();
+      };
+    }
+
+    const body = document.createElement('div');
+    body.className = 'mtask-body';
+    body.hidden = !open;
+    group.forEach((c) => mRenderRow(c, idx++, body, idx < mstate.clips.length));
+    card.append(head, body);
+    list.appendChild(card);
   });
   mUpdateMergeMeta();
+}
+
+// Move a whole task (all its clips stay together), then rebuild breakAfter so
+// the grouping stays coherent. Down lands after the target, up lands before it.
+function mMoveTask(from, to) {
+  const tasks = mSplitTasks();
+  if (from < 0 || to < 0 || from >= tasks.length || to >= tasks.length || from === to) return;
+  const [moved] = tasks.splice(from, 1);
+  tasks.splice(to, 0, moved);
+  const flat = [];
+  tasks.forEach((g, i) => g.forEach((c, j) => {
+    c.breakAfter = (j === g.length - 1 && i < tasks.length - 1);
+    flat.push(c);
+  }));
+  mstate.clips = flat;
+  mRender();
+  mSchedulePlan();
 }
 
 function mMove(from, to) {
@@ -1806,9 +1862,19 @@ $('mDeleteSources').onchange = () => {
   }
 };
 
-// Drag to reorder. Moving down lands after the target, moving up lands before
-// it — which is exactly what splice(from,1) + splice(to,0,item) does.
+// Two drag scopes: a collapsed/expanded card head reorders whole tasks; a clip
+// row reorders within the flat list. Only one is active at a time.
 $('mList').addEventListener('dragstart', (e) => {
+  // Controls inside a head (input/buttons) are not drag handles.
+  if (e.target.closest('input, button')) { e.preventDefault(); return; }
+  const head = e.target.closest('.mtask-head');
+  if (head) {
+    mstate.dragTask = Number(head.parentElement.dataset.task);
+    head.parentElement.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    try { e.dataTransfer.setData('text/plain', `task:${mstate.dragTask}`); } catch { /* Safari */ }
+    return;
+  }
   const row = e.target.closest('.mrow');
   if (!row) return;
   mstate.drag = Number(row.dataset.i);
@@ -1818,9 +1884,18 @@ $('mList').addEventListener('dragstart', (e) => {
 });
 $('mList').addEventListener('dragend', () => {
   mstate.drag = -1;
-  for (const r of document.querySelectorAll('.mrow')) r.classList.remove('dragging', 'drop-before', 'drop-after');
+  mstate.dragTask = -1;
+  for (const r of document.querySelectorAll('.mrow, .mtask-card')) r.classList.remove('dragging', 'drop-before', 'drop-after');
 });
 $('mList').addEventListener('dragover', (e) => {
+  if (mstate.dragTask >= 0) {
+    e.preventDefault();
+    const card = e.target.closest('.mtask-card');
+    if (!card) return;
+    for (const c of document.querySelectorAll('.mtask-card')) c.classList.remove('drop-before', 'drop-after');
+    card.classList.add(Number(card.dataset.task) < mstate.dragTask ? 'drop-before' : 'drop-after');
+    return;
+  }
   if (mstate.drag < 0) return;
   e.preventDefault();
   const row = e.target.closest('.mrow');
@@ -1829,6 +1904,16 @@ $('mList').addEventListener('dragover', (e) => {
   row.classList.add(Number(row.dataset.i) < mstate.drag ? 'drop-before' : 'drop-after');
 });
 $('mList').addEventListener('drop', (e) => {
+  if (mstate.dragTask >= 0) {
+    e.preventDefault();
+    const card = e.target.closest('.mtask-card');
+    const from = mstate.dragTask;
+    const to = card ? Number(card.dataset.task) : -1;
+    mstate.dragTask = -1;
+    for (const c of document.querySelectorAll('.mtask-card')) c.classList.remove('dragging', 'drop-before', 'drop-after');
+    if (to >= 0) mMoveTask(from, to);
+    return;
+  }
   if (mstate.drag < 0) return;
   e.preventDefault();
   const row = e.target.closest('.mrow');
