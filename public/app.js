@@ -597,6 +597,13 @@ async function intakeDataTransfer(dt) {
 // with bounded concurrency, so pasting hundreds of links no longer issues
 // hundreds of serial requests that can stall or get stuck.
 async function loadPaths(paths) {
+  // During a repair run, targets are fixed when start() begins. Adding files
+  // now would show them as pending while never executing them — misleading and
+  // easy to mistake for a dropped file. Keep the list read-only until done.
+  if (state.running) {
+    toast('修复进行中，请等本轮结束后再添加文件', 'bad');
+    return { added: 0, results: [] };
+  }
   const results = new Array(paths.length);
   let added = 0;
   try {
@@ -958,7 +965,7 @@ const mstate = {
   clips: [], running: false, abort: null, stopFlag: false,
   plan: null, plans: [], suggested: '', suggestedList: [], lastOutput: '', logs: [],
   summary: null, session: null,
-  drag: -1, dragTask: -1, mExpanded: new Set(),
+  drag: -1, dragTask: -1, mExpanded: new Set(), taskNames: {},
   planTimer: null, planSeq: 0, timer: null,
 };
 
@@ -985,7 +992,7 @@ function mActionTag(c) {
     silence: ['audio', '补静音'], encode: ['encode', '重编码'], skip: ['skip', '跳过'],
   };
   const [cls, label] = map[c.action] || ['none', c.action];
-  return `<span class="mtag ${cls}">${label}</span>`;
+  return `<span class="mtag ${esc(cls)}">${esc(label)}</span>`;
 }
 
 function clipActionOf(info, plan) {
@@ -1030,14 +1037,22 @@ function mNormOutName(raw, ext) {
   return `${dot}${s || 'video'}.${ext || 'mp4'}`;
 }
 
-// A per-task name override rides on the group's first clip (`outName`), so it
-// survives splitting and reordering without a parallel array to keep in sync.
+// A task's identity is its *set* of member paths, not whichever clip happens
+// to be first. Storing the name / expanded flag on `group[0]` loses them the
+// moment the user reorders rows inside the task. Sorting the paths makes the
+// key order-independent, so intra-task moves keep metadata; split/join create
+// a new set and therefore a fresh task with default settings (expected).
+function mTaskKey(group) {
+  return group.map((c) => c.path).sort().join('\u0001');
+}
+function mTaskName(group) {
+  return String(mstate.taskNames[mTaskKey(group)] || '');
+}
 // The value is passed through verbatim — the server's resolveOutput() decides
 // the folder (bare name → first clip's own folder) and always applies the
 // plan's extension. Never pre-build a path or keep a typed suffix here.
 function mTaskOutput(group) {
-  const s = String(group[0]?.outName || '').trim();
-  return s || null;
+  return mTaskName(group).trim() || null;
 }
 
 // A task boundary lives on the clip before it (`breakAfter`), so reordering and
@@ -1106,7 +1121,7 @@ function mTaskPlanTag(gi) {
   if (!p.ok) return '<span class="mtag skip">规格不一致</span>';
   const label = { copy: '无损拼接', remux: '重封装', encode: p.copyVideo ? '仅修音频' : '重编码' }[p.strategy] || p.strategy;
   const cls = (p.strategy === 'encode' && p.copyVideo) ? 'audio' : p.strategy;
-  return `<span class="mtag ${cls}">${label}</span>`;
+  return `<span class="mtag ${esc(cls)}">${esc(label)}</span>`;
 }
 
 function mRender() {
@@ -1116,6 +1131,10 @@ function mRender() {
   const tasks = mSplitTasks();
   const multi = tasks.length > 1;
   $('mGroupHint').hidden = mstate.clips.length < 2;
+  // Drop metadata for tasks that no longer exist after a split/join/removal.
+  const liveKeys = new Set(tasks.map(mTaskKey));
+  for (const k of Object.keys(mstate.taskNames)) if (!liveKeys.has(k)) delete mstate.taskNames[k];
+  for (const k of mstate.mExpanded) if (!liveKeys.has(k)) mstate.mExpanded.delete(k);
   let idx = 0;
   tasks.forEach((group, gi) => {
     if (!multi) {
@@ -1124,9 +1143,9 @@ function mRender() {
     }
 
     // The card head stays visible; only its body (the clip rows) is collapsible.
-    // A task's identity is its first clip's path, so expansion survives reorders
-    // and plan refreshes. New tasks start collapsed.
-    const key = group[0].path;
+    // Identity is the sorted member-path set, so both expansion and the custom
+    // product name survive row reordering and plan refreshes. New tasks start collapsed.
+    const key = mTaskKey(group);
     const open = mstate.mExpanded.has(key);
     const card = document.createElement('div');
     card.className = 'mtask-card' + (open ? ' open' : '');
@@ -1138,7 +1157,7 @@ function mRender() {
     const dur = group.reduce((s, c) => s + (c.dur || 0), 0);
     const bytes = group.reduce((s, c) => s + (c.size || 0), 0);
     const auto = mstate.suggestedList?.[gi];
-    const custom = group[0]?.outName || '';
+    const custom = mTaskName(group);
     const outPlaceholder = auto ? `默认 ${mBaseOf(auto)}` : '自动命名';
     const first = group[0];
     const firstLabel = first.name + (group.length > 1 ? ` 等 ${group.length} 段` : '');
@@ -1168,12 +1187,12 @@ function mRender() {
     outEl.onclick = (e) => e.stopPropagation();
     outEl.onchange = () => {
       const v = outEl.value.trim();
-      if (!v) group[0].outName = '';
-      else if (v.includes('/') || v.includes('\\')) group[0].outName = v;
-      else group[0].outName = mNormOutName(v, mstate.plans?.[gi]?.outExt || 'mp4');
-      outEl.value = group[0].outName;
-      outEl.classList.toggle('custom', !!group[0].outName);
-      outEl.placeholder = group[0].outName ? outPlaceholder : (auto ? `默认 ${mBaseOf(auto)}` : '自动命名');
+      if (!v) mstate.taskNames[key] = '';
+      else if (v.includes('/') || v.includes('\\')) mstate.taskNames[key] = v;
+      else mstate.taskNames[key] = mNormOutName(v, mstate.plans?.[gi]?.outExt || 'mp4');
+      outEl.value = mstate.taskNames[key];
+      outEl.classList.toggle('custom', !!mstate.taskNames[key]);
+      outEl.placeholder = mstate.taskNames[key] ? outPlaceholder : (auto ? `默认 ${mBaseOf(auto)}` : '自动命名');
     };
     outEl.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); outEl.blur(); } };
 
@@ -1453,9 +1472,11 @@ function showQueueResult(sum) {
   const failedPaths = new Set(trashErrs.map((e) => e.file));
   const kept = (tasks.flatMap((t) => (t.kept || []))).filter((p) => !failedPaths.has(p));
   const w = $('mResultWarn');
-  w.hidden = !trashErrs.length && !kept.length;
+  const partialStream = !!sum.partialStream;
+  w.hidden = !trashErrs.length && !kept.length && !partialStream;
   if (!w.hidden) {
     const parts = [];
+    if (partialStream) parts.push('<div>连接在队列结束前中断：以上仅列出已收到结果的任务，其余未执行状态未知，请核对产物后决定是否重跑。</div>');
     if (trashErrs.length) {
       parts.push(`<div>以下 ${trashErrs.length} 个源文件移入废纸篓失败，已原样保留：</div>`);
       for (const e of trashErrs.slice(0, 40)) {
@@ -1498,6 +1519,7 @@ function mSummarizeSummaries(list) {
   for (const s of list) {
     for (const k of ['total', 'succeeded', 'partial', 'failed', 'notRun', 'deletedCount', 'keptCount', 'trashErrorCount']) out[k] += s[k] || 0;
     out.deleteSources = out.deleteSources || !!s.deleteSources;
+    out.partialStream = out.partialStream || !!s.partialStream;
     for (const t of (s.tasks || [])) out.tasks.push({ ...t, index: out.tasks.length });
   }
   if (!list.length) out.deleteSources = !!$('mDeleteSources')?.checked;
@@ -1608,6 +1630,10 @@ async function mRunBatch(tasks) {
   const ctrl = new AbortController();
   mstate.abort = ctrl;
   let summary = null;
+  // Accumulate per-task records as they arrive. If the stream drops before
+  // `queue-done` (server restart / network), we can still show exactly which
+  // products were completed instead of a blank "队列异常中断".
+  const seenTasks = [];
   let doneTasks = 0;
   try {
     const res = await fetch('/api/merge-queue', {
@@ -1647,7 +1673,9 @@ async function mRunBatch(tasks) {
             c.info = info.ok ? info : null;
             if (info.duration) c.dur = info.duration;
           }
-          mRender();
+          // Rebuilding the DOM mid-drag detaches the dragged node, leaving
+          // mstate.drag/dragTask stuck ≥0 and later drags behaving erratically.
+          if (mstate.drag < 0 && mstate.dragTask < 0) mRender();
         }
       } else if (ev === 'task-progress') {
         $('mCurStage').textContent = d.stage || '合并中…';
@@ -1667,6 +1695,7 @@ async function mRunBatch(tasks) {
         if (d.outTime) bits.push(fmtDur(d.outTime));
         $('mCurMetrics').textContent = bits.join(' · ');
       } else if (ev === 'task-done') {
+        seenTasks[d.index] = d;
         doneTasks = d.index + 1;
         $('mStatusCounts').textContent = `${doneTasks} / ${tasks.length} 个任务已完成`;
         $('mBarTotal').style.width = `${(doneTasks / tasks.length) * 100}%`;
@@ -1689,6 +1718,23 @@ async function mRunBatch(tasks) {
   $('mBar').classList.remove('indeterminate');
   $('mElapsed').textContent = fmtClock(Date.now() - s.t0);
 
+  // Build a partial summary from task-done records if the stream ended early.
+  if (!summary && seenTasks.length) {
+    const records = seenTasks.filter(Boolean);
+    summary = {
+      total: tasks.length,
+      succeeded: records.filter((t) => t.ok && (!doDelete || t.verified)).length,
+      partial: records.filter((t) => t.ok && doDelete && !t.verified).length,
+      failed: records.filter((t) => !t.ok).length,
+      notRun: tasks.length - records.length,
+      deletedCount: records.reduce((n, t) => n + (t.deleted?.length || 0), 0),
+      keptCount: records.reduce((n, t) => n + (t.kept?.length || 0), 0),
+      trashErrorCount: records.reduce((n, t) => n + (t.trashErrors?.length || 0), 0),
+      deleteSources: doDelete,
+      tasks: records,
+      partialStream: true,
+    };
+  }
   if (summary) {
     s.summaries.push(summary);
     // Sources moved to the trash have dead paths: drop them from the work list.

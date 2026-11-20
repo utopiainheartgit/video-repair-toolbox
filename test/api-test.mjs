@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { request as httpRequest } from 'node:http';
 import { readFile, stat, readdir, writeFile, rm, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { makeSamples } from './samples.mjs';
@@ -259,6 +260,30 @@ await rm(bareOut, { force: true }).catch(() => {});
 await rm(join(DIR, 'merged'), { recursive: true, force: true }).catch(() => {});
 
 for (const f of [ma, mb, join(DIR, '.api_merged.mp4')]) await rm(f, { force: true }).catch(() => {});
+
+// --- Request validation / cross-site hardening ---
+const wrongCt = await fetch(BASE + '/api/trash-failed', {
+  method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '{"paths":[]}',
+});
+check('非 JSON 请求被拒绝', wrongCt.status === 415, `HTTP ${wrongCt.status}`);
+
+// Node's fetch() overrides the Host header, so use raw http to simulate a
+// DNS-rebinding request carrying a foreign Host.
+const badHostStatus = await new Promise((resolve) => {
+  const req = httpRequest({
+    host: '127.0.0.1', port: 8731, path: '/api/scan', method: 'POST',
+    headers: { 'Content-Type': 'application/json', Host: 'evil.example', 'Content-Length': 2 },
+  }, (res) => { res.resume(); resolve(res.statusCode); });
+  req.on('error', () => resolve(0));
+  req.end('{}');
+});
+check('跨站 Host 被拒绝', badHostStatus === 403, `HTTP ${badHostStatus}`);
+
+// Malformed file entries must not kill the SSE stream: a file-done + done must
+// still arrive so the client does not treat it as a dropped connection.
+const malEvts = await sse('/api/jobs', { mode: 'diagnose', files: [{}] });
+check('畸形文件项仍返回 file-done', malEvts.some((e) => e.ev === 'file-done'));
+check('畸形文件项不中断 SSE', malEvts.some((e) => e.ev === 'done'));
 
 console.log(`\n=== API 结果： ${pass} 通过, ${fail} 失败 ===\n`);
 process.exit(fail ? 1 : 0);

@@ -32,14 +32,41 @@ function json(res, code, obj) {
 
 function readBody(req, limit = 8 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
-    let buf = '';
+    // Accumulate raw bytes, then decode once. Concatenating per-chunk strings
+    // corrupts multi-byte UTF-8 (Chinese paths) split across chunk boundaries,
+    // and buf.length counts UTF-16 units rather than bytes.
+    const chunks = [];
+    let bytes = 0;
     req.on('data', (d) => {
-      buf += d;
-      if (buf.length > limit) { reject(new Error('请求体过大')); req.destroy(); }
+      bytes += d.length;
+      if (bytes > limit) { reject(new Error('请求体过大')); req.destroy(); return; }
+      chunks.push(d);
     });
-    req.on('end', () => { try { resolve(buf ? JSON.parse(buf) : {}); } catch (e) { reject(e); } });
+    req.on('end', () => {
+      try {
+        const text = Buffer.concat(chunks).toString('utf8');
+        resolve(text ? JSON.parse(text) : {});
+      } catch (e) { reject(e); }
+    });
     req.on('error', reject);
   });
+}
+
+// Reject cross-origin / non-JSON state-changing requests. This is a localhost
+// tool, but without these checks any web page could drive the delete endpoints
+// via DNS rebinding + a text/plain POST (which skips CORS preflight).
+function rejectCrossSite(req, res) {
+  const host = String(req.headers.host || '');
+  if (host && host !== `${HOST}:${PORT}` && host !== HOST) {
+    json(res, 403, { error: '拒绝跨站请求' });
+    return false;
+  }
+  const ct = String(req.headers['content-type'] || '');
+  if (!/^application\/json\b/i.test(ct)) {
+    json(res, 415, { error: '请使用 application/json' });
+    return false;
+  }
+  return true;
 }
 
 function sseStart(res) {
@@ -170,12 +197,16 @@ function pickFilesNative(multiple) {
   });
 }
 
+// Escape a value embedded in an AppleScript double-quoted string. macOS file
+// names can contain newlines; without this they break out of the literal.
+const asQuoted = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  .replace(/\r/g, '\\r').replace(/\n/g, '\\n').replace(/\t/g, '\\t');
+
 // Native macOS save panel, so the merged file can be placed anywhere without
 // the browser ever handling bytes.
 function pickSaveNative(defaultName) {
   return new Promise((resolve) => {
-    const esc = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    const script = `POSIX path of (choose file name with prompt "保存合并后的视频" default name "${esc(defaultName)}")`;
+    const script = `POSIX path of (choose file name with prompt "保存合并后的视频" default name "${asQuoted(defaultName)}")`;
     const child = spawn('osascript', ['-e', script], { stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '', err = '';
     child.stdout.on('data', (d) => { out += d; });
@@ -190,7 +221,7 @@ function pickSaveNative(defaultName) {
 
 function revealInFinder(file) {
   if (process.platform !== 'darwin') return Promise.resolve(false);
-  const esc = file.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const esc = asQuoted(file);
   return new Promise((resolve) => {
     const c = spawn('osascript', ['-e', `tell application "Finder"
 activate
@@ -204,6 +235,10 @@ end tell`], { stdio: ['ignore', 'pipe', 'pipe'] });
 
 async function handleApi(req, res, url) {
   const p = url.pathname;
+  // Every state-changing endpoint consumes a JSON body and may touch local
+  // files (including the trash). Require a same-origin JSON POST so a random
+  // web page cannot drive them via DNS rebinding / simple text/plain requests.
+  if (req.method === 'POST' && !rejectCrossSite(req, res)) return;
 
   if (p === '/api/capabilities' && req.method === 'GET') {
     const untrunc = await findUntrunc();
@@ -312,7 +347,8 @@ async function handleApi(req, res, url) {
     // req.destroyed flips true once the POST body is consumed, so it cannot
     // signal client cancellation here — watch the response socket instead.
     let aborted = false;
-    res.on('close', () => { aborted = true; });
+    const ctrl = new AbortController();
+    res.on('close', () => { aborted = true; ctrl.abort(); });
     const refOk = reference && await stat(reference).catch(() => null);
     const base = Math.max(0, Math.floor(Number(resumeFrom) || 0));
     send('start', { total: base + files.length, mode, deep, untrunc: await findUntrunc(), reference: refOk ? reference : null });
@@ -323,7 +359,14 @@ async function handleApi(req, res, url) {
     const job = randomUUID();
     for (const f of files) {
       if (aborted || res.writableEnded) break;
-      const path = typeof f === 'string' ? f : f.path;
+      const path = typeof f === 'string' ? f : f?.path;
+      // A malformed entry must not abort the whole SSE stream without a
+      // file-done/done event (the client would treat it as a dropped connection).
+      if (typeof path !== 'string' || !path) {
+        failed++;
+        send('file-done', { index: done, path: String(path ?? ''), name: '无效路径', verdict: 'error', action: 'failed', reasons: ['无效的文件路径'] });
+        continue;
+      }
       const name = basename(path);
       send('file-start', { index: done, path, name });
       const msgs = [];
@@ -333,7 +376,7 @@ async function handleApi(req, res, url) {
 
       try {
         prog({ stage: '探测容器与结构', percent: null });
-        diag = await diagnose(path, { deep, onProgress: prog });
+        diag = await diagnose(path, { deep, onProgress: prog, signal: ctrl.signal });
         send('diagnosis', { index: done, path, name, diagnosis: diag });
 
         if (mode === 'diagnose') {
@@ -356,7 +399,7 @@ async function handleApi(req, res, url) {
             reference: refOk ? reference : null,
             referencePool: refOk ? await healthySiblings(reference) : [],
             allowReencode, diagnosis: diag,
-            onLog: log, onProgress: prog, isAborted: () => aborted,
+            onLog: log, onProgress: prog, isAborted: () => aborted, signal: ctrl.signal,
           });
           tried = r.tried;
           attempts = r.attempts || [];
