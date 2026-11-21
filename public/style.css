@@ -526,6 +526,10 @@ input[type=text] { min-width: 0; }
 .mtag.encode { color: #e8c97a; border-color: #4d3c14; background: #2a2416; }
 .mtag.skip { color: var(--bad); border-color: #5c2724; background: #2b1a19; }
 .mtag.none { color: var(--dim2); }
+.mtag.st-running { color: #9dc0f5; border-color: #33496d; background: #18233a; }
+.mtag.st-queued { color: #e8c97a; border-color: #4d3c14; background: #2a2416; }
+.mtag.st-done { color: #7ee2a0; border-color: #23492c; background: #14251a; }
+.mtag.st-idle { display: none; }
 .mrow .badge { font-size: 11px; padding: 2px 7px; }
 
 /* ============================ merge result ============================ */
@@ -610,6 +614,13 @@ input[type=text] { min-width: 0; }
 }
 .mtask-sub { font-size: 11.5px; color: var(--dim2); white-space: nowrap; }
 .mtask-plan { flex: none; }
+.mtask-card.is-running .mtask-head { background: linear-gradient(180deg, #1a2638, #17202e); }
+.mtask-card.is-queued .mtask-head { background: linear-gradient(180deg, #232015, #1c1a12); }
+.mtask-next {
+  padding: 6px 14px 7px 46px; font-size: 11.5px; color: #d8b871;
+  background: #211d13; border-bottom: 1px solid #3a2f16;
+}
+.mtask-next[hidden] { display: none; }
 .mtask-body { border-top: 1px solid #21252e; }
 .mtask-body .mrow:first-child { border-top: none; }
 .mtask-out {

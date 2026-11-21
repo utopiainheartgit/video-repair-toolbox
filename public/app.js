@@ -1014,7 +1014,25 @@ function mAppendFiles(files) {
     });
     added++;
   }
+  if (added) mCutMidRunBoundary();
   return added;
+}
+
+// While a batch is running, newly added clips must become their OWN task —
+// otherwise mSplitTasks() folds them into the currently-running group, so no
+// separate card (and no product-name field) appears for them. Insert a boundary
+// right after the last already-submitted clip. Repeated adds before that batch
+// ends all land in the same pending task, which is the natural expectation.
+function mCutMidRunBoundary() {
+  if (!mstate.running || !mstate.session) return;
+  const done = mstate.session.donePaths;
+  let lastSubmitted = -1;
+  for (let i = 0; i < mstate.clips.length; i++) {
+    if (done.has(mstate.clips[i].path)) lastSubmitted = i;
+  }
+  if (lastSubmitted >= 0 && lastSubmitted < mstate.clips.length - 1) {
+    mstate.clips[lastSubmitted].breakAfter = true;
+  }
 }
 
 function mDirOf(p) {
@@ -1124,6 +1142,63 @@ function mTaskPlanTag(gi) {
   return `<span class="mtag ${esc(cls)}">${esc(label)}</span>`;
 }
 
+// Session-scoped task state. `donePaths` is deliberately NOT used here: it
+// means "already submitted to the server", which flips to true the moment a
+// batch starts, so a running task would be misread as finished. These two sets
+// are updated from SSE events instead — `activeTaskPaths` for the task whose
+// ffmpeg is running now, `finishedPaths` for tasks that already reported back.
+function mAllIn(group, set) {
+  return !!set && group.length > 0 && group.every((c) => set.has(c.path));
+}
+function mTaskStatus(group) {
+  if (!mstate.running || !mstate.session) return '';
+  if (mAllIn(group, mstate.session.finishedPaths)) return 'done';
+  if (mAllIn(group, mstate.session.activeTaskPaths)) return 'running';
+  return 'queued';
+}
+function mTaskStatusTag(group) {
+  const st = mTaskStatus(group);
+  if (!st) return '';
+  return `<span class="mtag st-${st}" data-role="task-status">${{ running: '运行中', queued: '排队中', done: '已完成' }[st]}</span>`;
+}
+function mTaskNextHint(group) {
+  if (mTaskStatus(group) !== 'queued') return '';
+  if (group.length < 2) return '还需再加 1 段才会自动开始';
+  if (group.some((c) => c.error)) return '有片段无法解析，移除后才能自动开始';
+  return mAllIn(group, mstate.session.activePaths)
+    ? '本批次稍后自动开始'
+    : '当前批次结束后自动开始，可先改名';
+}
+
+// Badges/hints change on every task-start / task-done. Rebuilding the whole
+// list would blur the rename field the user may be typing in, so patch only
+// the two small nodes in place. Cards are keyed by the set of member paths,
+// which stays stable across plan refreshes and mid-run appends.
+function mUpdateTaskBadges() {
+  const byPath = new Map(mstate.clips.map((c) => [c.path, c]));
+  const cards = $('mList').querySelectorAll('.mtask-card');
+  for (const card of cards) {
+    const group = String(card.dataset.key || '').split('\u0001').map((p) => byPath.get(p)).filter(Boolean);
+    if (!group.length) continue;
+    const st = mTaskStatus(group);
+    const badge = card.querySelector('[data-role="task-status"]');
+    if (badge) {
+      badge.className = st ? `mtag st-${st}` : 'mtag st-idle';
+      badge.textContent = st ? { running: '运行中', queued: '排队中', done: '已完成' }[st] : '';
+      badge.hidden = !st;
+    }
+    const hint = card.querySelector('[data-role="task-next"]');
+    if (hint) {
+      const text = mTaskNextHint(group);
+      hint.textContent = text;
+      hint.hidden = !text;
+    }
+    card.classList.toggle('is-running', st === 'running');
+    card.classList.toggle('is-queued', st === 'queued');
+    card.classList.toggle('is-done', st === 'done');
+  }
+}
+
 function mRender() {
   const list = $('mList');
   list.innerHTML = '';
@@ -1150,6 +1225,7 @@ function mRender() {
     const card = document.createElement('div');
     card.className = 'mtask-card' + (open ? ' open' : '');
     card.dataset.task = String(gi);
+    card.dataset.key = key;
 
     const head = document.createElement('div');
     head.className = 'mtask-head';
@@ -1164,6 +1240,7 @@ function mRender() {
     head.innerHTML = `<span class="mtask-grip" title="拖动整张卡调整任务顺序">⠿</span>`
       + `<button type="button" class="mtask-toggle" title="${open ? '收起' : '展开'}该任务的片段">${open ? '▾' : '▸'}</button>`
       + `<span class="mtask-no">任务 ${gi + 1}</span>`
+      + mTaskStatusTag(group)
       + `<span class="mtask-summary"><span class="mtask-first" title="${esc(first.path)}">${esc(firstLabel)}</span>`
       + `<span class="mtask-sub">${group.length} 段${dur ? ` · ${fmtDur(dur)}` : ''}${bytes ? ` · ${fmtSize(bytes)}` : ''}</span></span>`
       + `<span class="mtask-plan">${mTaskPlanTag(gi)}</span>`
@@ -1208,11 +1285,17 @@ function mRender() {
       };
     }
 
+    const next = document.createElement('div');
+    next.className = 'mtask-next';
+    next.dataset.role = 'task-next';
+    next.textContent = mTaskNextHint(group);
+    next.hidden = !next.textContent;
+
     const body = document.createElement('div');
     body.className = 'mtask-body';
     body.hidden = !open;
     group.forEach((c) => mRenderRow(c, idx++, body, idx < mstate.clips.length));
-    card.append(head, body);
+    card.append(head, next, body);
     list.appendChild(card);
   });
   mUpdateMergeMeta();
@@ -1295,16 +1378,24 @@ function mSchedulePlan() {
   mstate.planTimer = setTimeout(mRefreshPlan, 450);
 }
 
+// Rebuilding the list mid-drag detaches the dragged node and leaves
+// mstate.drag/dragTask stuck ≥0. Both the plan refresh and the SSE clips
+// handler use this guard so async work never fights an in-flight drag.
+function mRenderIfIdle() {
+  if (mstate.drag < 0 && mstate.dragTask < 0) mRender();
+}
+
 // Each task is planned independently: a group of 4K clips and a group of 720p
 // clips should not be forced onto a shared target just because they share a
 // list. Requests run sequentially so a 50-task list does not flood ffprobe.
+// Also runs mid-session: clips added during a merge need a plan badge so the
+// queued task shows its merge method and real output extension.
 async function mRefreshPlan() {
-  if (mstate.running) return;
   const tasks = mSplitTasks();
-  if (!tasks.length) { mstate.plans = []; mstate.plan = null; mRender(); return; }
+  if (!tasks.length) { mstate.plans = []; mstate.plan = null; mRenderIfIdle(); return; }
   const seq = ++mstate.planSeq;
   for (const c of mstate.clips) c.action = undefined;
-  mRender();
+  mRenderIfIdle();
   const plans = [];
   const suggestions = [];
   try {
@@ -1349,7 +1440,7 @@ async function mRefreshPlan() {
   } catch (e) {
     if (seq === mstate.planSeq) toast(`分析片段失败：${e}`, 'bad');
   }
-  mRender();
+  mRenderIfIdle();
 }
 
 async function mLoadPaths(paths) {
@@ -1586,6 +1677,10 @@ async function mStart() {
     manual,
     summaries: [],
     donePaths: new Set(),
+    // UI-only progress tracking (see mTaskStatus): submitted != running != done.
+    activePaths: new Set(),
+    activeTaskPaths: new Set(),
+    finishedPaths: new Set(),
     batchNo: 0,
     t0: Date.now(),
   };
@@ -1607,6 +1702,9 @@ async function mRunBatch(tasks) {
   const single = tasks.length === 1;
   const doDelete = s.opts.doDelete;
   for (const t of tasks) for (const c of t) s.donePaths.add(c.path);
+  s.activePaths = new Set(tasks.flat().map((c) => c.path));
+  s.activeTaskPaths = new Set(tasks[0].map((c) => c.path));
+  mUpdateTaskBadges();
 
   const panel = $('mStatusPanel');
   panel.hidden = false;
@@ -1654,6 +1752,8 @@ async function mRunBatch(tasks) {
       if (ev === 'queue-start') {
         $('mCurStage').textContent = `共 ${d.total} 个任务，准备中…`;
       } else if (ev === 'task-start') {
+        s.activeTaskPaths = new Set((tasks[d.index] || []).map((c) => c.path));
+        mUpdateTaskBadges();
         $('mStatusTitle').textContent = `${tag}正在合并任务 ${d.index + 1} / ${d.total}`;
         $('mStatusCounts').textContent = `${doneTasks} / ${d.total} 个任务已完成`;
         $('mCurClip').textContent = d.names?.[0] || '—';
@@ -1695,6 +1795,8 @@ async function mRunBatch(tasks) {
         if (d.outTime) bits.push(fmtDur(d.outTime));
         $('mCurMetrics').textContent = bits.join(' · ');
       } else if (ev === 'task-done') {
+        for (const c of (tasks[d.index] || [])) s.finishedPaths.add(c.path);
+        mUpdateTaskBadges();
         seenTasks[d.index] = d;
         doneTasks = d.index + 1;
         $('mStatusCounts').textContent = `${doneTasks} / ${tasks.length} 个任务已完成`;

@@ -35,6 +35,14 @@ async function sse(path, body) {
 }
 
 await makeSamples();
+// Default merge products are intentionally excluded from /api/scan, so a
+// previous interrupted run leaves them behind and the next run's collision
+// avoidance produces `..._merged-2.mp4`, breaking the naming assertions.
+for (const f of await readdir(DIR)) {
+  if (/^api_merge_a_merged(?:_t\d+)?(?:-\d+)?\.mp4$/.test(f)) {
+    await rm(join(DIR, f), { force: true }).catch(() => {});
+  }
+}
 const scan = await (await fetch(BASE + '/api/scan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: DIR }) })).json();
 const files = scan.files.map((f) => f.path);
 console.log(`\n=== 扫描到 ${files.length} 个视频 ===`);
