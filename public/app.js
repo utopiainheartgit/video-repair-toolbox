@@ -580,10 +580,9 @@ async function intakeDataTransfer(dt) {
 
   toast('正在打开原生选择器以获取真实路径（拖入的内容需在弹窗中确认），随后直接原地修复…', '');
   if (hasDir) {
-    const r = await fetch('/api/pick-folder', { method: 'POST' });
-    const d = await r.json();
-    if (d.ok) await loadPath(d.path);
-    else if (!d.cancelled) toast(d.error || '选择失败', 'bad');
+    const d = await pickFolder().catch(() => null);
+    if (d?.ok) await loadPath(d.path);
+    else if (d && !d.cancelled) toast(d.error || '选择失败', 'bad');
   } else {
     const d = await fetch('/api/pick-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ multiple: true }) }).then((r) => r.json()).catch(() => null);
     if (d?.ok) {
@@ -876,6 +875,17 @@ drop.addEventListener('drop', async (e) => { e.preventDefault(); await intakeDat
 drop.addEventListener('click', (e) => { if (e.target === drop || (e.target.closest('.drop-inner') && !e.target.closest('button,input,textarea,.paste-box'))) pickFiles(); });
 drop.addEventListener('keydown', (e) => { if (e.target.closest('input,textarea,button,select')) return; if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pickFiles(); } });
 
+// The server requires a JSON Content-Type on every POST as its cross-site /
+// DNS-rebinding defence. A native folder pick has no payload, but the header
+// is still mandatory — a bodyless POST used to get a 415 "请使用 application/json"
+// and the picker never opened. Keep this in one place so all four entry points
+// (repair button, repair drop, merge button, merge drop) stay in sync.
+function pickFolder() {
+  return fetch('/api/pick-folder', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+  }).then((r) => r.json());
+}
+
 async function pickFiles() {
   const d = await fetch('/api/pick-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ multiple: true }) }).then((r) => r.json()).catch(() => null);
   if (d?.ok) {
@@ -887,10 +897,9 @@ async function pickFiles() {
 $('pickFiles').onclick = (e) => { e.stopPropagation(); pickFiles(); };
 $('pickFolder').onclick = async (e) => {
   e.stopPropagation();
-  const r = await fetch('/api/pick-folder', { method: 'POST' });
-  const d = await r.json();
-  if (d.ok) await loadPath(d.path);
-  else if (!d.cancelled) toast(d.error || '选择失败', 'bad');
+  const d = await pickFolder().catch(() => null);
+  if (d?.ok) await loadPath(d.path);
+  else if (d && !d.cancelled) toast(d.error || '选择失败', 'bad');
 };
 $('pathGo').onclick = (e) => { e.stopPropagation(); loadMany(); };
 $('pathInput').onclick = (e) => e.stopPropagation();
@@ -1477,7 +1486,7 @@ async function mIntakeDataTransfer(dt) {
   if (!files.length && !hasDir) { toast('没有识别到视频文件', 'bad'); return; }
   toast('正在打开原生选择器以获取真实路径…', '');
   if (hasDir) {
-    const d = await fetch('/api/pick-folder', { method: 'POST' }).then((r) => r.json()).catch(() => null);
+    const d = await pickFolder().catch(() => null);
     if (d?.ok) {
       const { added } = await mLoadPaths([d.path]);
       toast(added ? `已加入 ${added} 个片段` : '没有新增片段', added ? 'ok' : '');
@@ -1929,7 +1938,7 @@ async function mPickFiles() {
 $('mPickFiles').onclick = (e) => { e.stopPropagation(); mPickFiles(); };
 $('mPickFolder').onclick = async (e) => {
   e.stopPropagation();
-  const d = await fetch('/api/pick-folder', { method: 'POST' }).then((r) => r.json()).catch(() => null);
+  const d = await pickFolder().catch(() => null);
   if (d?.ok) {
     const { added } = await mLoadPaths([d.path]);
     toast(added ? `已按文件名顺序加入 ${added} 个片段` : '该文件夹没有新的视频', added ? 'ok' : '');

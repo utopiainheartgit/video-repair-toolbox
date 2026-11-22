@@ -287,6 +287,24 @@ const badHostStatus = await new Promise((resolve) => {
 });
 check('跨站 Host 被拒绝', badHostStatus === 403, `HTTP ${badHostStatus}`);
 
+// The native folder picker POST has no payload, but it still has to carry the
+// JSON header. Guard BOTH sides of that contract: a bodyless request must be
+// rejected, and every frontend call site must send the header. Without the
+// second check the picker silently dies with "请使用 application/json".
+const noCtFolder = await new Promise((resolve) => {
+  const req = httpRequest({
+    host: '127.0.0.1', port: 8731, path: '/api/pick-folder', method: 'POST',
+    headers: { 'Content-Length': 0 },
+  }, (res) => { res.resume(); resolve(res.statusCode); });
+  req.on('error', () => resolve(0));
+  req.end();
+});
+check('无 JSON 头的文件夹选择被拒绝', noCtFolder === 415, `HTTP ${noCtFolder}`);
+const appSrc = await readFile(join(import.meta.dirname, '..', 'public', 'app.js'), 'utf8');
+const folderCalls = [...appSrc.matchAll(/fetch\('\/api\/pick-folder'[\s\S]*?\)\.then/g)].map((m) => m[0]);
+check('文件夹选择调用均带 JSON 头', folderCalls.length > 0
+  && folderCalls.every((s) => s.includes("'Content-Type': 'application/json'")), `调用数 ${folderCalls.length}`);
+
 // Malformed file entries must not kill the SSE stream: a file-done + done must
 // still arrive so the client does not treat it as a dropped connection.
 const malEvts = await sse('/api/jobs', { mode: 'diagnose', files: [{}] });
