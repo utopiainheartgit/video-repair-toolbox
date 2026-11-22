@@ -15,9 +15,53 @@ const PORT = Number(process.env.PORT || 8731);
 const HOST = '127.0.0.1';
 const PUBLIC = join(import.meta.dirname, 'public');
 const STAGED = new Map();
-// Only paths the latest repair job actually failed on may be trashed, so a
-// buggy or hostile client cannot turn the delete endpoint into arbitrary rm.
-let lastFailedPaths = [];
+// Only paths that actually failed repair may be trashed, so a buggy or hostile
+// client cannot turn the delete endpoint into arbitrary rm. This used to be a
+// plain array that was CLEARED at the start of every repair and lost on restart;
+// a second repair (or a server restart) silently made earlier failed items
+// undeletable. Keep it as a persistent, latest-action-wins registry instead.
+const failedPaths = new Map(); // normalised absolute path -> last failure timestamp
+const MAX_FAILED_PATHS = 5000;
+
+function noteFailed(p) {
+  if (typeof p !== 'string' || !p) return;
+  const key = normalizePath(p);
+  if (!key) return;
+  failedPaths.delete(key);
+  failedPaths.set(key, new Date().toISOString());
+  while (failedPaths.size > MAX_FAILED_PATHS) {
+    failedPaths.delete(failedPaths.keys().next().value);
+  }
+}
+
+// Rebuild the deletable set from the append-only job log on startup. The log
+// records every repair outcome, so the latest action per path wins: a file that
+// was later repaired successfully is NOT reopened for deletion after a restart.
+async function loadFailedPaths() {
+  try {
+    const text = await readFile(LOG_FILE, 'utf8');
+    const latest = new Map();
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      let r;
+      try { r = JSON.parse(line); } catch { continue; }
+      if (r.mode !== 'repair' || typeof r.path !== 'string' || !r.path) continue;
+      if (r.action !== 'failed' && r.action !== 'repaired') continue;
+      const key = normalizePath(r.path);
+      if (!key) continue;
+      const prev = latest.get(key);
+      if (!prev || String(r.ts || '') >= prev.ts) {
+        latest.set(key, { ts: String(r.ts || ''), failed: r.action === 'failed' });
+      }
+    }
+    for (const [key, v] of latest) if (v.failed) failedPaths.set(key, v.ts);
+    while (failedPaths.size > MAX_FAILED_PATHS) {
+      failedPaths.delete(failedPaths.keys().next().value);
+    }
+  } catch {
+    // A missing/unreadable log just means an empty registry this session.
+  }
+}
 
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -354,8 +398,6 @@ async function handleApi(req, res, url) {
     send('start', { total: base + files.length, mode, deep, untrunc: await findUntrunc(), reference: refOk ? reference : null });
 
     let done = base, repaired = 0, skipped = 0, failed = 0;
-    if (mode === 'repair') lastFailedPaths = [];
-    const noteFailed = (pp) => { if (mode === 'repair') lastFailedPaths.push(pp); };
     const job = randomUUID();
     for (const f of files) {
       if (aborted || res.writableEnded) break;
@@ -406,6 +448,8 @@ async function handleApi(req, res, url) {
           level = r.level || null;
           if (r.ok && r.replaced) {
             repaired++;
+            // Successfully repaired: no longer a deletion candidate.
+            failedPaths.delete(normalizePath(path));
             prog({ stage: '已覆盖原文件', percent: 100 });
             log(`已覆盖原文件，策略：${r.strategy}${r.level === 'degraded' ? '（降级修复：可播放但可能有残留错误，建议另存备份）' : ''}`);
             action = 'repaired'; strategy = r.strategy;
@@ -779,14 +823,42 @@ async function handleApi(req, res, url) {
 
   if (p === '/api/trash-failed' && req.method === 'POST') {
     const { paths = [] } = await readBody(req);
-    const allowed = new Set(lastFailedPaths);
-    const targets = (Array.isArray(paths) ? paths : []).filter((x) => typeof x === 'string' && allowed.has(x));
     const trashed = [], errors = [];
-    for (const t of targets) {
-      const r = await trashFile(t);
-      if (r?.ok !== false) trashed.push(t); else errors.push({ path: t, reason: r.reason || '移入废纸篓失败' });
+    const seen = new Set();
+    for (const raw of (Array.isArray(paths) ? paths : [])) {
+      if (typeof raw !== 'string' || !raw.trim()) {
+        errors.push({ path: String(raw ?? ''), reason: '无效路径' });
+        continue;
+      }
+      // Match the registry by normalised absolute path, but always move the
+      // ORIGINAL path string the client gave us (it is already absolute from
+      // scan; normalisation here is only for lookup safety).
+      const key = normalizePath(raw);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (!failedPaths.has(key)) {
+        // Never silently skip: tell the user exactly why nothing happened.
+        errors.push({
+          path: raw,
+          reason: '该失败项已失效（服务重启或已重新诊断），请重新诊断失败文件后再删除',
+          stale: true,
+        });
+        continue;
+      }
+      const r = await trashFile(raw);
+      if (r?.ok !== false) {
+        trashed.push(raw);
+        failedPaths.delete(key);
+      } else {
+        errors.push({ path: raw, reason: r?.reason || '移入废纸篓失败' });
+      }
     }
-    lastFailedPaths = lastFailedPaths.filter((x) => !trashed.includes(x));
+    const record = {
+      ts: new Date().toISOString(), job: randomUUID(), mode: 'trash-failed',
+      requested: (Array.isArray(paths) ? paths : []).length,
+      trashed, errors,
+    };
+    await appendJobLog(record);
     return json(res, 200, { trashed, errors });
   }
 
@@ -825,8 +897,13 @@ const server = createServer(async (req, res) => {
   }
 });
 
+// Restore the deletable-failed set BEFORE accepting requests, so a failed item
+// from an earlier run (or before a restart) remains actionable.
+await loadFailedPaths();
+
 server.listen(PORT, HOST, () => {
   console.log(`视频修复工具已启动： http://${HOST}:${PORT}`);
   console.log(`运行日志： ${LOG_FILE}`);
+  console.log(`可删除的失败记录： ${failedPaths.size} 条`);
   console.log('按 Ctrl+C 停止。');
 });

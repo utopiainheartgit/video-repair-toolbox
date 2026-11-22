@@ -305,6 +305,33 @@ const folderCalls = [...appSrc.matchAll(/fetch\('\/api\/pick-folder'[\s\S]*?\)\.
 check('文件夹选择调用均带 JSON 头', folderCalls.length > 0
   && folderCalls.every((s) => s.includes("'Content-Type': 'application/json'")), `调用数 ${folderCalls.length}`);
 
+// --- failed-item deletion whitelist ---
+// A path outside the registry must NOT be silently skipped: it has to report a
+// reason so the UI can tell the user to re-diagnose instead of a bare "删除失败".
+const staleRes = await fetch(BASE + '/api/trash-failed', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ paths: [join(DIR, '.never-failed.mp4')] }),
+});
+const staleData = await staleRes.json();
+check('白名单外路径不静默跳过', staleData.errors?.length === 1 && staleData.trashed?.length === 0);
+check('白名单外路径给出原因与 stale 标记', /重新诊断|失效/.test(staleData.errors?.[0]?.reason || '') && staleData.errors?.[0]?.stale === true);
+
+// A real repair failure must enter the registry and stay deletable across a
+// SECOND repair job — the old code cleared the whitelist on every repair.
+const failFile = join(DIR, '.api_whitelist_fail.mp4');
+await writeFile(failFile, Buffer.from('not a video'));
+const sseFail = await sse('/api/jobs', { mode: 'repair', files: [failFile], deep: false });
+check('修复失败项进入删除白名单', sseFail.some((e) => e.ev === 'file-done' && e.d.action === 'failed'));
+// Running another repair must not evict the earlier failed path.
+await sse('/api/jobs', { mode: 'repair', files: [join(DIR, 'healthy.mp4')], deep: false });
+const delRes = await fetch(BASE + '/api/trash-failed', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ paths: [failFile] }),
+});
+const delData = await delRes.json();
+check('二次修复后旧失败项仍可删除', delData.trashed?.includes(failFile), JSON.stringify(delData));
+check('删除操作写入日志', (await readFile(join(import.meta.dirname, '..', 'logs', 'repair-history.jsonl'), 'utf8')).includes('"mode":"trash-failed"'));
+
 // Malformed file entries must not kill the SSE stream: a file-done + done must
 // still arrive so the client does not treat it as a dropped connection.
 const malEvts = await sse('/api/jobs', { mode: 'diagnose', files: [{}] });

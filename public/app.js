@@ -548,12 +548,15 @@ async function deleteFailed(list, { ask = true } = {}) {
       });
       const data = await r.json();
       const trashed = new Set(data.trashed || []);
+      // The server returns a reason per failure (including "stale whitelist").
+      // Surface it instead of a bare filename so the user knows what to do.
+      const reasonByPath = new Map((data.errors || []).map((e) => [e.path, e.reason]));
       for (const it of pathItems) {
         if (trashed.has(it.path)) { it.status = 'deleted'; trashedN++; }
-        else errors.push(it.name);
+        else errors.push({ name: it.name, path: it.path, reason: reasonByPath.get(it.path) || '未知原因' });
       }
-    } catch {
-      for (const it of pathItems) errors.push(it.name);
+    } catch (e) {
+      for (const it of pathItems) errors.push({ name: it.name, path: it.path, reason: String(e) });
     }
   }
   btn.disabled = false;
@@ -561,7 +564,13 @@ async function deleteFailed(list, { ask = true } = {}) {
   render();
   const parts = [];
   if (trashedN) parts.push(`${trashedN} 个已移入废纸篓`);
-  if (errors.length) parts.push(`${errors.length} 个删除失败：${errors.slice(0, 3).join('、')}${errors.length > 3 ? ' 等' : ''}`);
+  if (errors.length) {
+    const first = errors[0];
+    const detail = errors.length === 1
+      ? `${first.name}：${first.reason}`
+      : `${errors.slice(0, 3).map((e) => `${e.name}（${e.reason}）`).join('、')}${errors.length > 3 ? ' 等' : ''}`;
+    parts.push(`${errors.length} 个删除失败：${detail}`);
+  }
   toast(parts.join('；') || '没有可删除的文件', errors.length ? 'bad' : 'ok');
   return { trashed: trashedN, removed: 0, errors };
 }
