@@ -27,6 +27,19 @@ The same server also handles merging: it probes every clip, shows you the strate
 
 Double-click `启动视频修复.command` ("Start Video Repair"). It checks the dependencies, starts the local service, and opens the UI in your browser.
 
+### Windows
+
+Double-click `启动视频修复.bat`. It checks Node.js, ffmpeg and ffprobe, configures the environment, starts the local service and opens the browser. Install [Node.js](https://nodejs.org/) (20.11+) and [ffmpeg](https://www.gyan.dev/ffmpeg/builds/), then either put `ffmpeg.exe` / `ffprobe.exe` on `PATH` or drop them into `vendor\ffmpeg\bin\`. untrunc is optional: grab the Windows build from [anthwlock/untrunc releases](https://github.com/anthwlock/untrunc/releases/latest) and save it as `vendor\untrunc\untrunc.exe`.
+
+Native pickers, save dialogs, Explorer reveal and Recycle Bin deletion all work on Windows; UI wording switches to "Recycle Bin" / "Show in Explorer" automatically. Paths can also be overridden manually:
+
+```bat
+set FFMPEG_BIN=C:\tools\ffmpeg\bin\ffmpeg.exe
+set FFPROBE_BIN=C:\tools\ffmpeg\bin\ffprobe.exe
+set UNTRUNC_BIN=C:\tools\untrunc.exe
+启动视频修复.bat
+```
+
 ### Manual start
 
 ```bash
@@ -48,7 +61,7 @@ Close the terminal window or press Ctrl+C to stop the service.
 | Node.js 20.11+ | The server uses `import.meta.dirname`. |
 | ffmpeg / ffprobe | Must be on `PATH`; the launcher also checks `/opt/homebrew/bin`. |
 | untrunc (optional) | Enables moov index rebuild. A prebuilt copy or sources are in `vendor/untrunc`; build `untrunc` or `untrunc-81`, or put one on `PATH`. |
-| macOS (optional) | Required only for the `.command` launcher and the native picker/save panels. The web UI itself works with any modern browser. |
+| macOS / Windows | Required only for native pickers, save panels, Trash/Recycle Bin and the matching launcher. The web UI itself works with any modern browser. |
 
 Install on macOS with Homebrew:
 

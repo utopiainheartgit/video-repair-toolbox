@@ -1,5 +1,10 @@
 const $ = (id) => document.getElementById(id);
 const state = { items: [], running: false, abort: null, stopFlag: false, caps: null, rootHandle: null, phase: 'idle', retryCount: 0 };
+
+// Platform-specific wording. macOS uses Finder/废纸篓, Windows uses
+// 资源管理器/回收站; all user-facing strings go through these helpers.
+const trashWord = () => state.caps?.platform === 'win32' ? '回收站' : '废纸篓';
+const revealWord = () => state.caps?.platform === 'win32' ? '在资源管理器中显示' : '在 Finder 中显示';
 const VIDEO_RE = /\.(mp4|m4v|mov|mkv|avi|webm|flv|wmv|mpg|mpeg|ts|m2ts|mts|3gp|3g2|ogv|vob|divx|f4v|rm|rmvb|asf|mxf)$/i;
 
 function fmtSize(n) {
@@ -101,6 +106,23 @@ async function loadCaps() {
     const r = await fetch('/api/capabilities');
     const c = await r.json();
     state.caps = c;
+    if (c.platform === 'win32') {
+      // Static labels live in index.html. Rewrite them once; every dynamic
+      // string already goes through trashWord()/revealWord().
+      const swap = (s) => String(s).replaceAll('废纸篓', '回收站')
+        .replaceAll('在 Finder 中显示', '在资源管理器中显示');
+      for (const el of [document.body, ...document.body.querySelectorAll('*')]) {
+        for (const n of el.childNodes) {
+          if (n.nodeType === 3 && n.nodeValue && /废纸篓|Finder/.test(n.nodeValue)) {
+            n.nodeValue = swap(n.nodeValue);
+          }
+        }
+        for (const a of ['title', 'placeholder']) {
+          const v = el.getAttribute?.(a);
+          if (v && /废纸篓|Finder/.test(v)) el.setAttribute(a, swap(v));
+        }
+      }
+    }
     const ready = !!(c.ffmpeg && c.untrunc);
     $('caps').innerHTML = `<div class="env" id="envBox">
       <button type="button" class="env-btn" id="envBtn" aria-expanded="false" title="查看运行环境">
@@ -484,8 +506,8 @@ function renderFailedPanel() {
       + `<span class="fp-why" title="${esc(why)}">${esc(why)}</span>`;
     body.appendChild(row);
   }
-  $('fpNote').innerHTML = '全部移入<strong>废纸篓</strong>，可随时还原。';
-  $('fpDelete').textContent = `删除 ${list.length} 个失败源文件（移入废纸篓）`;
+  $('fpNote').innerHTML = `全部移入<strong>${trashWord()}</strong>，可随时还原。`;
+  $('fpDelete').textContent = `删除 ${list.length} 个失败源文件（移入${trashWord()}）`;
 }
 
 // Retry only the failed files. They go through the same diagnose→confirm→repair
@@ -531,15 +553,16 @@ async function deleteFailed(list, { ask = true } = {}) {
     const bytes = list.reduce((n, it) => n + (it.size || 0), 0);
     const ok = await askConfirm({
       title: '删除失败源文件',
-      subtitle: `将 ${list.length} 个修复失败的文件移入废纸篓`,
+      subtitle: `将 ${list.length} 个修复失败的文件移入${trashWord()}`,
       icon: 'trash', tone: 'danger',
       stats: [
         { label: '文件数', value: String(list.length) },
         { label: '涉及大小', value: fmtSize(bytes) },
       ],
       lines: ['只删除失败文件，健康 / 已修复的文件不受影响。'],
-      warn: '文件移入废纸篓，可随时还原；不会永久删除。',
-      confirmText: '移入废纸篓', dangerConfirm: true,
+      warn: `文件移入${trashWord()}，可随时还原；不会永久删除。`,
+      confirmText: `移入${trashWord()}`, dangerConfirm: true,
+
     });
     if (!ok) return empty;
   }
@@ -570,7 +593,7 @@ async function deleteFailed(list, { ask = true } = {}) {
   renderFailedPanel();
   render();
   const parts = [];
-  if (trashedN) parts.push(`${trashedN} 个已移入废纸篓`);
+  if (trashedN) parts.push(`${trashedN} 个已移入${trashWord()}`);
   if (errors.length) {
     const first = errors[0];
     const detail = errors.length === 1
@@ -1381,7 +1404,7 @@ function mUpdateMergeMeta() {
 
   const badGroups = tasks.filter((t) => t.length < 2).length;
   if (badGroups) parts.push(`<span class="bad"><b>${badGroups} 个任务只有 1 段</b></span>`);
-  if ($('mDeleteSources').checked && n >= 2) parts.push('<span class="bad"><b>成功后移入废纸篓</b></span>');
+  if ($('mDeleteSources').checked && n >= 2) parts.push(`<span class="bad"><b>成功后移入${trashWord()}</b></span>`);
 
   $('mCounts').innerHTML = parts.join('');
   $('mStart').disabled = n < 2 || mstate.running || badGroups > 0;
@@ -1553,7 +1576,7 @@ function showQueueResult(sum) {
   if (sum.partial) bits.push(`${sum.partial} 需复核`);
   if (sum.failed) bits.push(`${sum.failed} 失败`);
   if (sum.notRun) bits.push(`${sum.notRun} 未执行`);
-  if (sum.deletedCount) bits.push(`已移入废纸篓 ${sum.deletedCount} 个源文件`);
+  if (sum.deletedCount) bits.push(`已移入${trashWord()} ${sum.deletedCount} 个源文件`);
   if (sum.keptCount) bits.push(`保留 ${sum.keptCount} 个源文件`);
   if (sum.trashErrorCount) bits.push(`删除失败 ${sum.trashErrorCount} 个`);
   $('mResultSub').textContent = bits.join(' · ');
@@ -1574,7 +1597,7 @@ function showQueueResult(sum) {
       if (t.duration) det.push(fmtDur(t.duration));
       if (t.size) det.push(fmtSize(t.size));
     }
-    if (t.deleted?.length) det.push(`已移入废纸篓 ${t.deleted.length} 个`);
+    if (t.deleted?.length) det.push(`已移入${trashWord()} ${t.deleted.length} 个`);
     if (t.kept?.length) det.push(`保留 ${t.kept.length} 个源文件`);
     if (t.trashErrors?.length) det.push(`删除失败 ${t.trashErrors.length} 个：${t.trashErrors[0].reason}`);
     const why = t.verifiedReason || (t.reasons || [])[0];
@@ -1597,7 +1620,7 @@ function showQueueResult(sum) {
     const parts = [];
     if (partialStream) parts.push('<div>连接在队列结束前中断：以上仅列出已收到结果的任务，其余未执行状态未知，请核对产物后决定是否重跑。</div>');
     if (trashErrs.length) {
-      parts.push(`<div>以下 ${trashErrs.length} 个源文件移入废纸篓失败，已原样保留：</div>`);
+      parts.push(`<div>以下 ${trashErrs.length} 个源文件移入${trashWord()}失败，已原样保留：</div>`);
       for (const e of trashErrs.slice(0, 40)) {
         parts.push(`<div class="mw-path">任务 ${e.task} · ${esc(e.file)}<span class="mw-why">${esc(e.reason)}</span></div>`);
       }
@@ -1682,8 +1705,8 @@ async function mStart() {
     : [{ label: '输出文件', value: '各自存到该任务首个片段所在文件夹，命名如 <首段名>_merged_t01.mp4' }];
   const warn = doDelete
     ? (skipCount
-        ? `合并成功后将把源文件移入废纸篓（可还原）。仅零告警且校验通过的任务会删，否则整组保留。<br>注意：有 <b>${skipCount}</b> 个片段无法解析，所在任务会整组保留源文件。`
-        : '合并成功后将把源文件移入废纸篓（可还原）。仅零告警且校验通过的任务会删，否则整组保留。')
+        ? `合并成功后将把源文件移入${trashWord()}（可还原）。仅零告警且校验通过的任务会删，否则整组保留。<br>注意：有 <b>${skipCount}</b> 个片段无法解析，所在任务会整组保留源文件。`
+        : `合并成功后将把源文件移入${trashWord()}（可还原）。仅零告警且校验通过的任务会删，否则整组保留。`)
     : '';
   const ok = await askConfirm({
     title: single ? '确认合并' : `确认合并 ${tasks.length} 个任务`,
@@ -1910,7 +1933,7 @@ function mFinishRun(stopped, leftover = 0) {
     const firstOut = combined.tasks.find((t) => t.output);
     if (firstOut) mstate.lastOutput = firstOut.output;
     showQueueResult(combined);
-    const tail = combined.deletedCount ? ` · 已移入废纸篓 ${combined.deletedCount} 个源文件` : '';
+    const tail = combined.deletedCount ? ` · 已移入${trashWord()} ${combined.deletedCount} 个源文件` : '';
     toast(`${combined.succeeded} 成功${combined.failed ? ` / ${combined.failed} 失败` : ''}${tail}`, clean ? 'ok' : 'bad');
   } else {
     panel.classList.add(stopped ? 'warn' : 'bad');
@@ -2027,14 +2050,14 @@ $('mReveal').onclick = async () => {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path: mstate.lastOutput }),
   }).then((x) => x.json()).catch(() => null);
-  if (!r?.ok) toast('无法在 Finder 中显示（可能只支持 macOS）', 'bad');
+  if (!r?.ok) toast(`${revealWord()}失败（当前系统可能不支持）`, 'bad');
 };
 
 for (const id of ['mMode', 'mSize', 'mQuality']) $(id).onchange = () => mSchedulePlan();
 $('mDeleteSources').onchange = () => {
   mUpdateMergeMeta();
   if ($('mDeleteSources').checked) {
-    toast('已开启：仅在零告警且时长校验通过时，把源文件移入废纸篓', '');
+    toast(`已开启：仅在零告警且时长校验通过时，把源文件移入${trashWord()}`, '');
   }
 };
 

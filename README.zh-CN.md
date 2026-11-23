@@ -27,6 +27,21 @@ MP4/MOV 文件损坏，通常是录制中断、存储卡非正常拔出或传输
 
 双击 `启动视频修复.command`。脚本会检查依赖、启动本地服务，并在浏览器中打开界面。
 
+### Windows
+
+双击 `启动视频修复.bat`。脚本会依次检查 Node.js、ffmpeg、ffprobe，设置好环境变量后启动本地服务并打开浏览器。
+
+需要先安装 [Node.js](https://nodejs.org/)（20.11+）和 [ffmpeg](https://www.gyan.dev/ffmpeg/builds/)，并确保 `ffmpeg.exe` / `ffprobe.exe` 在 `PATH` 中；也可以直接放到 `vendor\ffmpeg\bin\` 下，脚本会自动使用。untrunc 是可选的：从 [anthwlock/untrunc 的 Releases](https://github.com/anthwlock/untrunc/releases/latest) 下载 Windows 版，命名为 `vendor\untrunc\untrunc.exe` 即可启用索引重建。
+
+Windows 下原生文件夹/文件选择器、保存对话框、资源管理器定位、回收站删除均可正常使用，界面文案会自动切换为「回收站」「在资源管理器中显示」。也可手动指定路径：
+
+```bat
+set FFMPEG_BIN=C:\tools\ffmpeg\bin\ffmpeg.exe
+set FFPROBE_BIN=C:\tools\ffmpeg\bin\ffprobe.exe
+set UNTRUNC_BIN=C:\tools\untrunc.exe
+启动视频修复.bat
+```
+
 ### 手动启动
 
 ```bash
@@ -48,7 +63,7 @@ PORT=9000 node server.mjs
 | Node.js 20.11+ | 服务端使用了 `import.meta.dirname`。 |
 | ffmpeg / ffprobe | 需在 `PATH` 中；启动脚本也会检查 `/opt/homebrew/bin`。 |
 | untrunc（可选） | 用于 moov 索引重建。`vendor/untrunc` 内有现成程序或源码；编译出 `untrunc` / `untrunc-81`，或放到 `PATH` 中。 |
-| macOS（可选） | 仅 `.command` 启动脚本和原生选择器/保存面板需要；Web 界面本身支持任意现代浏览器。 |
+| macOS / Windows | 仅原生选择器、保存面板、废纸篓/回收站和对应启动脚本需要；Web 界面本身支持任意现代浏览器。 |
 
 macOS 上用 Homebrew 安装：
 

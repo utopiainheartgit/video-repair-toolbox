@@ -3,12 +3,14 @@ import { readFile, readdir, stat, mkdtemp, mkdir, rm, open } from 'node:fs/promi
 import { join, extname, basename, resolve, sep } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
 import { isVideoFile, diagnose, cachedDiagnose, invalidateDiagnosis, FFMPEG, FFPROBE, run } from './lib/probe.mjs';
 import { repairFile, repairInPlace, findUntrunc, cleanupWork } from './lib/repair.mjs';
 import { probeClip, buildPlan, mergeClips, defaultOutput, resolveOutput, isMergeProduct } from './lib/merge.mjs';
 import { verifyProduct, trashSources } from './lib/queue.mjs';
-import { moveToTrash as trashFile } from './lib/trash.mjs';
+import {
+  pickFolder, pickFiles, pickSave, reveal as revealFile, moveToTrash as trashFile,
+  nativePickerAvailable,
+} from './lib/platform.mjs';
 import { appendJobLog, LOG_FILE } from './lib/joblog.mjs';
 
 const PORT = Number(process.env.PORT || 8731);
@@ -257,77 +259,6 @@ async function referencePoolFor(brokenFile, explicitRef = null, max = 24) {
   return pool.slice(0, max + 2);
 }
 
-// Native macOS folder picker — the only way to get a real writable path in
-// browsers without the File System Access API (Safari, Firefox).
-function pickFolderNative() {
-  return new Promise((resolve) => {
-    const script = 'POSIX path of (choose folder with prompt "选择要扫描的视频文件夹")';
-    const child = spawn('osascript', ['-e', script], { stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '', err = '';
-    child.stdout.on('data', (d) => { out += d; });
-    child.stderr.on('data', (d) => { err += d; });
-    child.on('error', () => resolve({ ok: false, error: '无法调用 osascript' }));
-    child.on('close', (code) => {
-      if (code !== 0) return resolve({ ok: false, cancelled: /User canceled/i.test(err), error: err.trim() });
-      resolve({ ok: true, path: out.trim() });
-    });
-  });
-}
-
-function pickFilesNative(multiple) {
-  return new Promise((resolve) => {
-    const script = multiple
-      ? 'set fs to choose file with prompt "选择视频文件（可多选）" with multiple selections allowed\nset o to ""\nrepeat with f in fs\nset o to o & POSIX path of f & linefeed\nend repeat\nreturn o'
-      : 'POSIX path of (choose file with prompt "选择一个参考视频（同设备录制的完好文件）")';
-    const child = spawn('osascript', ['-e', script], { stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '', err = '';
-    child.stdout.on('data', (d) => { out += d; });
-    child.stderr.on('data', (d) => { err += d; });
-    child.on('error', () => resolve({ ok: false, error: '无法调用 osascript' }));
-    child.on('close', (code) => {
-      if (code !== 0) return resolve({ ok: false, cancelled: /User canceled/i.test(err), error: err.trim() });
-      const paths = out.split('\n').map((s) => s.trim()).filter(Boolean);
-      resolve({ ok: true, paths });
-    });
-  });
-}
-
-// Escape a value embedded in an AppleScript double-quoted string. macOS file
-// names can contain newlines; without this they break out of the literal.
-const asQuoted = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')
-  .replace(/\r/g, '\\r').replace(/\n/g, '\\n').replace(/\t/g, '\\t');
-
-// Native macOS save panel, so the merged file can be placed anywhere without
-// the browser ever handling bytes.
-function pickSaveNative(defaultName) {
-  return new Promise((resolve) => {
-    const script = `POSIX path of (choose file name with prompt "保存合并后的视频" default name "${asQuoted(defaultName)}")`;
-    const child = spawn('osascript', ['-e', script], { stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '', err = '';
-    child.stdout.on('data', (d) => { out += d; });
-    child.stderr.on('data', (d) => { err += d; });
-    child.on('error', () => resolve({ ok: false, error: '无法调用 osascript' }));
-    child.on('close', (code) => {
-      if (code !== 0) return resolve({ ok: false, cancelled: /User canceled/i.test(err), error: err.trim() });
-      resolve({ ok: true, path: out.trim() });
-    });
-  });
-}
-
-function revealInFinder(file) {
-  if (process.platform !== 'darwin') return Promise.resolve(false);
-  const esc = asQuoted(file);
-  return new Promise((resolve) => {
-    const c = spawn('osascript', ['-e', `tell application "Finder"
-activate
-reveal POSIX file "${esc}"
-end tell`], { stdio: ['ignore', 'pipe', 'pipe'] });
-    const t = setTimeout(() => { c.kill('SIGKILL'); resolve(false); }, 15_000);
-    c.on('error', () => { clearTimeout(t); resolve(false); });
-    c.on('close', (code) => { clearTimeout(t); resolve(code === 0); });
-  });
-}
-
 async function handleApi(req, res, url) {
   const p = url.pathname;
   // Every state-changing endpoint consumes a JSON body and may touch local
@@ -345,19 +276,19 @@ async function handleApi(req, res, url) {
       // machine, so we resolve real paths and repair in place — never stream
       // whole file bytes through the browser.
       handleMode: false, pathMode: true,
-      nativePicker: process.platform === 'darwin',
+      nativePicker: nativePickerAvailable(),
       logFile: LOG_FILE,
     });
   }
 
   if (p === '/api/pick-folder' && req.method === 'POST') {
-    const r = await pickFolderNative();
+    const r = await pickFolder();
     return json(res, 200, r);
   }
 
   if (p === '/api/pick-file' && req.method === 'POST') {
     const { multiple = true } = await readBody(req);
-    const r = await pickFilesNative(!!multiple);
+    const r = await pickFiles(!!multiple);
     if (r.ok && multiple) r.paths = r.paths.filter((f) => isVideoFile(f));
     return json(res, 200, r);
   }
@@ -568,7 +499,7 @@ async function handleApi(req, res, url) {
 
   if (p === '/api/pick-save' && req.method === 'POST') {
     const { defaultName = 'merged.mp4' } = await readBody(req);
-    return json(res, 200, await pickSaveNative(basename(String(defaultName)) || 'merged.mp4'));
+    return json(res, 200, await pickSave(basename(String(defaultName)) || 'merged.mp4'));
   }
 
   if (p === '/api/reveal' && req.method === 'POST') {
@@ -576,7 +507,7 @@ async function handleApi(req, res, url) {
     const abs = normalizePath(target);
     const st = abs ? await stat(abs).catch(() => null) : null;
     if (!st) return json(res, 404, { error: '文件不存在或无权限' });
-    return json(res, 200, { ok: await revealInFinder(abs) });
+    return json(res, 200, { ok: await revealFile(abs) });
   }
 
   // Probe every clip and decide the cheapest safe strategy up front, so the UI

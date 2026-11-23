@@ -413,6 +413,42 @@ async function main() {
     clearDiagnosisCache();
   }
 
+  console.log('\n=== 11. 平台抽象层 / Windows 脚本 ===');
+  {
+    const plat = await import('../lib/platform.mjs');
+    const winPlat = await import('../lib/platform-win.mjs');
+    const { moveToTrash: trashMove } = await import('../lib/trash.mjs');
+
+    check('平台后端被正确识别', ['mac', 'win', 'unsupported'].includes(plat.activeBackend), plat.activeBackend);
+    check('桌面平台提供原生选择器', plat.nativePickerAvailable() === (process.platform === 'darwin' || process.platform === 'win32'));
+    check('五个平台接口齐全', ['pickFolder', 'pickFiles', 'pickSave', 'reveal', 'moveToTrash']
+      .every((k) => typeof plat[k] === 'function'));
+    if (plat.activeBackend === 'mac') {
+      check('macOS 回收站实现接入平台层', plat.moveToTrash === trashMove);
+    }
+
+    const scripts = Object.entries(winPlat.SCRIPTS)
+      .map(([k, v]) => [k, typeof v === 'function' ? v(true) : v]);
+    const isAscii = (s) => /^[\x00-\x7f]*$/.test(s);
+    check('Windows 脚本为纯 ASCII（避免 OEM 代码页乱码）', scripts.every(([, s]) => isAscii(s)),
+      scripts.filter(([, s]) => !isAscii(s)).map(([k]) => k).join(','));
+    check('Windows 脚本强制 UTF-8 输出', scripts.every(([, s]) => s.includes('[System.Text.Encoding]::UTF8')));
+    check('选择文件夹使用 FolderBrowserDialog', winPlat.SCRIPTS.pickFolder.includes('FolderBrowserDialog'));
+    check('多选文件使用 OpenFileDialog + Multiselect',
+      /OpenFileDialog/.test(winPlat.SCRIPTS.pickFiles(true)) && winPlat.SCRIPTS.pickFiles(true).includes('$true'));
+    check('单选文件关闭 Multiselect', winPlat.SCRIPTS.pickFiles(false).includes('$false'));
+    check('保存对话框使用 SaveFileDialog', winPlat.SCRIPTS.pickSave.includes('SaveFileDialog'));
+    check('三个选择器脚本都有独立取消标记',
+      [winPlat.SCRIPTS.pickFolder, winPlat.SCRIPTS.pickFiles(true), winPlat.SCRIPTS.pickSave]
+        .every((s) => s.includes('__VT_CANCEL__')));
+    check('定位使用资源管理器 /select', winPlat.SCRIPTS.reveal.includes('/select,'));
+    check('删除走回收站而非永久删除',
+      winPlat.SCRIPTS.trash.includes('SendToRecycleBin') && !winPlat.SCRIPTS.trash.includes('Remove-Item'));
+    check('删除后验证源文件已消失', winPlat.SCRIPTS.trash.includes('Test-Path -LiteralPath'));
+    check('用户数据只从环境变量读取', scripts.every(([, s]) => /\$env:VTOOL_/.test(s)));
+    check('脚本中不出现中文路径字面量', scripts.every(([, s]) => !/[一-龥]/.test(s)));
+  }
+
   console.log(`\n=== 结果： ${pass} 通过, ${fail} 失败 ===\n`);
   process.exit(fail ? 1 : 0);
 }
