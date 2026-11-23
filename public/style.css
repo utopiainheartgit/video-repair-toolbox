@@ -354,6 +354,11 @@ input[type=text] { min-width: 0; }
 .badge.broken, .badge.failed, .badge.error, .badge.unreadable { color: var(--bad); border-color: #5c2724; background: #2b1a19; }
 .badge.repaired { color: #fff; border-color: var(--ok); background: #238636; }
 .badge.skipped { color: var(--ok); border-color: #23492c; background: #14251a; }
+.badge.prior-fail {
+  color: #f0b66b; border-color: #6b4a19; background: #2b2013;
+  margin-right: 6px; font-size: 10.5px; padding: 2px 7px; cursor: help;
+}
+.rl-row .badge.prior-fail { margin-right: 0; }
 
 .row-log { padding: 0 14px 12px; display: none; }
 .row.open .row-log { display: block; }

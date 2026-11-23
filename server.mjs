@@ -4,7 +4,7 @@ import { join, extname, basename, resolve, sep } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { isVideoFile, diagnose, FFMPEG, FFPROBE, run } from './lib/probe.mjs';
+import { isVideoFile, diagnose, cachedDiagnose, invalidateDiagnosis, FFMPEG, FFPROBE, run } from './lib/probe.mjs';
 import { repairFile, repairInPlace, findUntrunc, cleanupWork } from './lib/repair.mjs';
 import { probeClip, buildPlan, mergeClips, defaultOutput, resolveOutput, isMergeProduct } from './lib/merge.mjs';
 import { verifyProduct, trashSources } from './lib/queue.mjs';
@@ -20,18 +20,41 @@ const STAGED = new Map();
 // plain array that was CLEARED at the start of every repair and lost on restart;
 // a second repair (or a server restart) silently made earlier failed items
 // undeletable. Keep it as a persistent, latest-action-wins registry instead.
-const failedPaths = new Map(); // normalised absolute path -> last failure timestamp
+const failedPaths = new Map(); // normalised absolute path -> { ts, count }
 const MAX_FAILED_PATHS = 5000;
 
 function noteFailed(p) {
   if (typeof p !== 'string' || !p) return;
   const key = normalizePath(p);
   if (!key) return;
-  failedPaths.delete(key);
-  failedPaths.set(key, new Date().toISOString());
+  const prev = failedPaths.get(key);
+  failedPaths.set(key, {
+    ts: new Date().toISOString(),
+    count: (Number(prev?.count) || 0) + 1,
+  });
   while (failedPaths.size > MAX_FAILED_PATHS) {
     failedPaths.delete(failedPaths.keys().next().value);
   }
+}
+
+// Surfaced in scan results and diagnosis events: repeated failures are a strong
+// signal that re-running the same strategy chain is pointless. The user should
+// see this BEFORE spending another 10 minutes on the same file.
+function priorFailureFor(p) {
+  const key = normalizePath(p);
+  const v = key ? failedPaths.get(key) : null;
+  if (!v) return null;
+  const count = Number(v.count) || 1;
+  const at = String(v.ts || '');
+  const when = at ? new Date(at) : null;
+  const mins = when && !Number.isNaN(when.getTime())
+    ? Math.max(0, Math.round((Date.now() - when.getTime()) / 60000)) : null;
+  const ago = mins == null ? '' : mins < 1 ? '刚刚' : mins < 60 ? `${mins} 分钟前`
+    : mins < 1440 ? `${Math.round(mins / 60)} 小时前` : `${Math.round(mins / 1440)} 天前`;
+  return {
+    count, at, ago,
+    hint: `此前修复失败 ${count} 次${ago ? `（最近 ${ago}）` : ''}：建议换参考文件、换方案或重新下载，重复同样操作大概率仍失败`,
+  };
 }
 
 // Rebuild the deletable set from the append-only job log on startup. The log
@@ -41,6 +64,7 @@ async function loadFailedPaths() {
   try {
     const text = await readFile(LOG_FILE, 'utf8');
     const latest = new Map();
+    const counts = new Map();
     for (const line of text.split('\n')) {
       if (!line.trim()) continue;
       let r;
@@ -49,12 +73,15 @@ async function loadFailedPaths() {
       if (r.action !== 'failed' && r.action !== 'repaired') continue;
       const key = normalizePath(r.path);
       if (!key) continue;
+      if (r.action === 'failed') counts.set(key, (counts.get(key) || 0) + 1);
       const prev = latest.get(key);
       if (!prev || String(r.ts || '') >= prev.ts) {
         latest.set(key, { ts: String(r.ts || ''), failed: r.action === 'failed' });
       }
     }
-    for (const [key, v] of latest) if (v.failed) failedPaths.set(key, v.ts);
+    for (const [key, v] of latest) {
+      if (v.failed) failedPaths.set(key, { ts: v.ts, count: counts.get(key) || 1 });
+    }
     while (failedPaths.size > MAX_FAILED_PATHS) {
       failedPaths.delete(failedPaths.keys().next().value);
     }
@@ -180,7 +207,11 @@ async function scanDir(root, { maxFiles = 20000 } = {}) {
       if (e.isDirectory()) { if (e.name !== 'merged') stack.push(p); }
       else if (e.isFile() && isVideoFile(e.name) && !isMergeProduct(e.name)) {
         const s = await stat(p).catch(() => null);
-        if (s) out.push({ path: p, name: e.name, size: s.size, rel: p.slice(root.length).replace(/^\//, '') });
+        if (s) out.push({
+          path: p, name: e.name, size: s.size,
+          rel: p.slice(root.length).replace(/^\//, ''),
+          priorFailure: priorFailureFor(p),
+        });
       }
     }
   }
@@ -188,22 +219,42 @@ async function scanDir(root, { maxFiles = 20000 } = {}) {
   return out;
 }
 
-// Build a pool of candidate reference files from the reference's own folder.
-// untrunc needs a healthy recording with matching codec/resolution; scanning
-// the sibling videos gives repairFile something to auto-match against.
-async function healthySiblings(reference, max = 24) {
-  if (!reference) return [];
+// Build candidate references for a BROKEN file. untrunc needs a healthy
+// recording from the same device (matching codec/resolution/fingerprint). The
+// best candidates are the healthy siblings in the broken file's OWN folder —
+// most camera/user collections keep a whole batch together.
+//
+// The old version only ran when the user picked a reference manually and
+// scanned that reference's folder, so a moov-missing file sitting next to 50
+// healthy clips still got no reference. Repair-log analysis showed 14 moov
+// failures, 13 of which had healthy files in the same directory.
+async function referencePoolFor(brokenFile, explicitRef = null, max = 24) {
+  const seen = new Set();
+  const pool = [];
+  const add = (p) => {
+    const abs = resolve(p);
+    if (!seen.has(abs)) { seen.add(abs); pool.push(abs); }
+  };
+  // An explicitly chosen reference is the strongest signal: match it first.
+  if (explicitRef && await stat(explicitRef).then((s) => s.isFile(), () => false)) add(explicitRef);
+  // The broken file itself can never be its own reference — exclude it from
+  // the candidate scan below (but do not put it in the pool).
+  const skip = new Set(pool);
+  if (brokenFile) skip.add(resolve(brokenFile));
   try {
-    const dir = resolve(reference);
-    const parent = join(dir, '..');
+    const parent = join(resolve(brokenFile), '..');
     const entries = await readdir(parent, { withFileTypes: true });
-    const pool = entries
+    // Prefer files near the target alphabetically (camera sequences group
+    // together), then cap the work: matchReference ffprobes each candidate.
+    entries
       .filter((e) => e.isFile() && !e.name.startsWith('.') && isVideoFile(e.name))
       .map((e) => join(parent, e.name))
-      .filter((p) => p !== resolve(reference))
-      .slice(0, max);
-    return [resolve(reference), ...pool];
-  } catch { return []; }
+      .filter((p) => !skip.has(resolve(p)))
+      .sort((a, b) => basename(a).localeCompare(basename(b), 'zh'))
+      .slice(0, max)
+      .forEach(add);
+  } catch { /* unreadable folder just means no auto candidates */ }
+  return pool.slice(0, max + 2);
 }
 
 // Native macOS folder picker — the only way to get a real writable path in
@@ -320,7 +371,9 @@ async function handleApi(req, res, url) {
     if (!s) return { ok: false, error: `路径不存在：${abs}` };
     if (s.isFile()) {
       if (!isVideoFile(abs)) return { ok: false, error: '不是支持的视频文件' };
-      return { ok: true, root: abs, kind: 'file', files: [{ path: abs, name: basename(abs), size: s.size, rel: basename(abs) }] };
+      return { ok: true, root: abs, kind: 'file', files: [{
+        path: abs, name: basename(abs), size: s.size, rel: basename(abs), priorFailure: priorFailureFor(abs),
+      }] };
     }
     if (!s.isDirectory()) return { ok: false, error: `不是文件或文件夹：${abs}` };
     return { ok: true, root: abs, kind: 'dir', files: await scanDir(abs) };
@@ -410,36 +463,54 @@ async function handleApi(req, res, url) {
         continue;
       }
       const name = basename(path);
+      const prior = priorFailureFor(path);
       send('file-start', { index: done, path, name });
       const msgs = [];
       const log = (m) => { msgs.push(m); send('log', { index: done, path, message: m }); };
       const prog = (p) => send('file-progress', { index: done, path, ...p });
+      // Every file-done carries the history so the UI can keep the hint even
+      // after the result badge changes.
+      const doneEvent = (payload) => send('file-done', {
+        index: done, path, name, priorFailure: prior, ...payload,
+      });
       let diag = null, action = null, strategy = null, tried = null, reasons = null, attempts = [], level = null;
 
       try {
+        if (prior && mode === 'repair') log(`历史提示：${prior.hint}`);
         prog({ stage: '探测容器与结构', percent: null });
-        diag = await diagnose(path, { deep, onProgress: prog, signal: ctrl.signal });
-        send('diagnosis', { index: done, path, name, diagnosis: diag });
+        diag = await cachedDiagnose(path, { deep, onProgress: prog, signal: ctrl.signal });
+        if (diag.cached) log(`命中诊断缓存（${Math.round((diag.cacheAgeMs || 0) / 1000)} 秒内未变化），跳过重复探测`);
+        send('diagnosis', { index: done, path, name, priorFailure: prior, diagnosis: diag });
 
         if (mode === 'diagnose') {
           if (diag.verdict === 'healthy') skipped++;
           action = 'diagnosed';
-          send('file-done', { index: done, path, name, verdict: diag.verdict, action: 'diagnosed' });
+          doneEvent({ verdict: diag.verdict, action: 'diagnosed' });
         } else if (diag.verdict === 'healthy') {
           skipped++;
           log('文件健康，跳过');
           action = 'skipped';
-          send('file-done', { index: done, path, name, verdict: 'healthy', action: 'skipped' });
+          doneEvent({ verdict: 'healthy', action: 'skipped' });
         } else if (diag.verdict === 'unreadable') {
           failed++; noteFailed(path);
           action = 'failed'; reasons = ['文件不可读'];
-          send('file-done', { index: done, path, name, verdict: 'unreadable', action: 'failed', reasons: ['文件不可读'] });
+          doneEvent({ verdict: 'unreadable', action: 'failed', reasons: ['文件不可读'] });
         } else {
-          const needsRef = diag.problems.some((x) => x.code === 'MOOV_MISSING');
-          if (needsRef && !refOk) log('检测到 moov 缺失：未提供参考文件。将尝试裸流恢复；若同目录有其他健康视频可作参考，请设置参考文件后重试（成功率显著提升）');
+          const needsRef = diag.problems.some((x) => ['MOOV_MISSING', 'MOOV_INVALID', 'CORRUPT_DATA'].includes(x.code));
+          // Always offer same-folder candidates, even without a manual pick:
+          // matchReference() fingerprints each one and selects the best match.
+          const pool = needsRef ? await referencePoolFor(path, refOk ? reference : null) : [];
+          if (needsRef && !refOk && pool.length > 0) {
+            // One sibling is still a usable candidate — matchReference() checks
+            // its fingerprint. The old `> 1` guard claimed "no reference" while
+            // silently using that one file, which made logs misleading.
+            log(`自动参考：未手动选择参考文件，已从同目录找到 ${pool.length} 个候选，按指纹自动匹配`);
+          } else if (needsRef && !refOk) {
+            log('检测到索引/码流损坏：同目录没有其他可用视频作参考，将尝试裸流恢复');
+          }
           const r = await repairInPlace(path, {
             reference: refOk ? reference : null,
-            referencePool: refOk ? await healthySiblings(reference) : [],
+            referencePool: pool,
             allowReencode, diagnosis: diag,
             onLog: log, onProgress: prog, isAborted: () => aborted, signal: ctrl.signal,
           });
@@ -448,31 +519,34 @@ async function handleApi(req, res, url) {
           level = r.level || null;
           if (r.ok && r.replaced) {
             repaired++;
-            // Successfully repaired: no longer a deletion candidate.
+            // Successfully repaired: no longer a deletion candidate, and the
+            // old diagnosis no longer describes the file on disk.
             failedPaths.delete(normalizePath(path));
+            invalidateDiagnosis(path);
             prog({ stage: '已覆盖原文件', percent: 100 });
             log(`已覆盖原文件，策略：${r.strategy}${r.level === 'degraded' ? '（降级修复：可播放但可能有残留错误，建议另存备份）' : ''}`);
             action = 'repaired'; strategy = r.strategy;
             const publicAttempts = (r.attempts || []).map(({ strategy: s, ok, level: lv, ms, reasons: rs }) => ({ strategy: s, ok, level: lv, ms, reasons: rs }));
-            send('file-done', { index: done, path, name, verdict: 'repaired', action: 'repaired', strategy: r.strategy, tried: r.tried, attempts: publicAttempts, info: r.info, level: r.level || 'clean' });
+            doneEvent({ verdict: 'repaired', action: 'repaired', strategy: r.strategy, tried: r.tried, attempts: publicAttempts, info: r.info, level: r.level || 'clean' });
           } else {
             failed++; noteFailed(path);
             log(`修复失败，原文件未改动：${(r.reasons || []).join('；')}`);
             action = 'failed'; reasons = r.reasons;
             const publicAttempts = (r.attempts || []).map(({ strategy: s, ok, level: lv, ms, reasons: rs }) => ({ strategy: s, ok, level: lv, ms, reasons: rs }));
-            send('file-done', { index: done, path, name, verdict: diag.verdict, action: 'failed', tried: r.tried, attempts: publicAttempts, reasons: r.reasons });
+            doneEvent({ verdict: diag.verdict, action: 'failed', tried: r.tried, attempts: publicAttempts, reasons: r.reasons });
           }
         }
       } catch (e) {
         failed++; noteFailed(path);
         action = 'failed'; reasons = [String(e)];
-        send('file-done', { index: done, path, name, verdict: 'error', action: 'failed', reasons: [String(e)] });
+        doneEvent({ verdict: 'error', action: 'failed', reasons: [String(e)] });
       }
       const st = await stat(path).catch(() => null);
       await appendJobLog({
         ts: new Date().toISOString(), job, mode, deep,
         reference: refOk ? reference : null,
         path, name, size: st ? st.size : null,
+        priorFailure: prior || undefined,
         verdict: diag ? diag.verdict : 'error',
         problems: diag ? diag.problems : [],
         action, strategy, tried, reasons, level: level || (action === 'repaired' ? 'clean' : null),

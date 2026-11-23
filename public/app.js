@@ -262,7 +262,7 @@ function render() {
     const label = it.status === 'running'
       ? (it.percent != null ? `处理中 ${it.percent.toFixed(0)}%` : '处理中')
       : ({ pending: '待处理', healthy: '健康', damaged: '有损伤', broken: '严重损坏', repaired: '已修复', skipped: '已跳过', failed: '修复失败', error: '出错', unreadable: '不可读', deleted: '已删除' }[it.status] || it.status);
-    const detail = it.status === 'running'
+    let detail = it.status === 'running'
       ? `<span style="color:var(--accent)">${esc(it.stage || '处理中…')}</span>`
       : it.status === 'repaired'
       ? `<span class="strat">${esc(it.strategy)}</span>${it.level === 'degraded' ? '<span class="badge degraded">降级可用</span>' : ''}`
@@ -273,6 +273,11 @@ function render() {
           : it.diagnosis?.info
             ? `<span>${esc(metaLine(it.diagnosis.info))}</span>`
             : '<span style="color:var(--dim2)">—</span>';
+    // A file that already failed repair should warn BEFORE another attempt,
+    // not only in the expanded log after the user wasted time re-running it.
+    const priorTag = it.priorFailure && it.status !== 'running'
+      ? `<span class="badge prior-fail" title="${esc(it.priorFailure.hint || '')}">此前失败 ×${it.priorFailure.count}</span> ` : '';
+    detail = priorTag + detail;
     main.innerHTML = `<span class="c-name"><span class="fname" title="${esc(it.path || it.name)}">${esc(it.name)}</span>`
       + `<span class="frel">${esc(it.rel || (it.mode === 'handle' ? '拖拽句柄' : ''))}</span></span>`
       + `<span class="c-size">${fmtSize(it.size)}</span>`
@@ -319,6 +324,7 @@ function metaLine(info) {
 function buildLogText(it) {
   const L = [];
   if (it.path) L.push(`路径: ${it.path}`);
+  if (it.priorFailure) L.push(`历史: ${it.priorFailure.hint || `此前修复失败 ${it.priorFailure.count} 次`}`);
   L.push(`模式: ${it.mode === 'handle' ? '浏览器句柄（流式上传/回传）' : '服务端真实路径（原地修复）'}`);
   if (it.diagnosis) {
     const d = it.diagnosis;
@@ -424,12 +430,13 @@ function renderRepairList() {
     const row = document.createElement('label');
     row.className = `rl-row${it.selected ? '' : ' off'}`;
     const probs = (it.diagnosis.problems || []).map((p) => p.desc).join('；');
+    const priorHint = it.priorFailure ? `[此前失败 ×${it.priorFailure.count}] ` : '';
     row.innerHTML = `<input type="checkbox"${it.selected ? ' checked' : ''}>`
       + `<span class="rl-name"><span class="fname" title="${esc(it.path || it.name)}">${esc(it.name)}</span>`
       + `<span class="frel">${esc(it.rel || (it.mode === 'handle' ? '拖拽句柄' : ''))}</span></span>`
       + `<span class="rl-size">${fmtSize(it.size)}</span>`
       + `<span class="rl-meta"><span class="badge ${it.diagnosis.verdict}">${VERDICT_LABEL[it.diagnosis.verdict] || it.diagnosis.verdict}</span>`
-      + `<span class="rl-prob" title="${esc(probs)}">${esc(probs || '—')}</span></span>`;
+      + `<span class="rl-prob" title="${esc(priorHint + probs)}">${esc(priorHint + (probs || '—'))}</span></span>`;
     row.querySelector('input').onchange = (e) => {
       it.selected = e.target.checked;
       row.classList.toggle('off', !it.selected);
@@ -625,7 +632,7 @@ async function loadPaths(paths) {
       let n = 0;
       if (r.ok) {
         for (const f of (r.files || [])) {
-          if (addItem({ key: `p:${f.path}`, name: f.name, rel: f.rel, size: f.size, mode: 'path', path: f.path }, { quiet: true })) { added++; n++; }
+          if (addItem({ key: `p:${f.path}`, name: f.name, rel: f.rel, size: f.size, mode: 'path', path: f.path, priorFailure: f.priorFailure || null }, { quiet: true })) { added++; n++; }
         }
       }
       results[i] = { path: r.input ?? paths[i], ok: r.ok, kind: r.kind, count: r.count, added: n, error: r.error };
@@ -809,12 +816,15 @@ function handleEvent(ev, d, byPath) {
     it.logs.push(d.message);
     if (it.open) render();
   } else if (ev === 'diagnosis' && it) {
-    it.diagnosis = d.diagnosis; render();
+    it.diagnosis = d.diagnosis;
+    if (d.priorFailure) it.priorFailure = d.priorFailure;
+    render();
   } else if (ev === 'file-done' && it) {
     it.status = d.action === 'repaired' ? 'repaired' : d.action === 'skipped' ? 'skipped'
       : d.action === 'failed' ? 'failed' : d.verdict;
     it.strategy = d.strategy || ''; it.reasons = d.reasons || []; it.tried = d.tried || [];
     it.level = d.level || null; it.attempts = d.attempts || [];
+    if (d.priorFailure) it.priorFailure = d.priorFailure;
     it.percent = null; it.stage = '';
     if (d.action === 'repaired') status.repaired++;
     else if (d.action === 'skipped') status.skipped++;

@@ -2,7 +2,10 @@ import { readFile, writeFile, truncate, copyFile, stat, rm, mkdir, mkdtemp } fro
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
-import { diagnose, inspectBoxes, isVideoFile, getVideoExtradata, ffprobe, summarize, FFMPEG, run } from '../lib/probe.mjs';
+import {
+  diagnose, inspectBoxes, isVideoFile, getVideoExtradata, ffprobe, summarize, FFMPEG, run,
+  findDataStart, cachedDiagnose, invalidateDiagnosis, clearDiagnosisCache, diagnosisCacheStats,
+} from '../lib/probe.mjs';
 import { repairInPlace, findUntrunc } from '../lib/repair.mjs';
 import { parseSpsH264, parsePpsH264 } from '../lib/bitstream.mjs';
 import { tryRawStream } from '../lib/rawstream.mjs';
@@ -345,6 +348,69 @@ async function main() {
       (await moveToTrash(join(DIR, '.no-such-file.mp4'), { finder: async () => ({ ok: false, reason: 'x' }) })).reason === '文件不存在');
 
     await rm(fakeOut, { force: true }).catch(() => {});
+  }
+
+  console.log('\n=== 10. 前导零剥离 / 诊断缓存 ===');
+  {
+    const src = join(DIR, 'healthy.mp4');
+    const raw = await readFile(src);
+
+    // A long zero prefix before a valid MP4 must be reported as LEADING_ZEROS
+    // with the exact offset, so repair can strip it instead of giving up.
+    const zMp4 = join(DIR, '.leading_zero.mp4');
+    const zHead = Buffer.alloc(2 * 1024 * 1024);
+    await writeFile(zMp4, Buffer.concat([zHead, raw]));
+    const zs = await findDataStart(zMp4);
+    check('前导零 MP4 定位到真实容器起点', zs?.offset === zHead.length, JSON.stringify(zs));
+    const zd = await diagnose(zMp4);
+    check('前导零 MP4 命中 LEADING_ZEROS', zd.problems.some((p) => p.code === 'LEADING_ZEROS'), zd.problems.map((p) => p.code).join(','));
+
+    // Containerless Annex-B (the real interrupted-download pattern from the
+    // repair log) must also be detected, and raw-stream recovery must work on
+    // it without an mdat box to anchor on.
+    const annex = join(DIR, '.annexb.h264');
+    const conv = await run(FFMPEG, ['-y', '-v', 'error', '-i', src, '-map', '0:v:0', '-c:v', 'copy',
+      '-bsf:v', 'h264_mp4toannexb', '-f', 'h264', annex], { timeout: 120000 });
+    if (conv.code === 0) {
+      const aHead = Buffer.alloc(256 * 1024);
+      const zAnnex = join(DIR, '.leading_zero_annexb.mp4');
+      await writeFile(zAnnex, Buffer.concat([aHead, await readFile(annex)]));
+      const as = await findDataStart(zAnnex);
+      check('前导零裸流定位到首个 Annex-B start code', as?.offset === aHead.length, JSON.stringify(as));
+      const work = await mkdtemp(join(tmpdir(), 'vrep-lz-'));
+      const logs = [];
+      let out = null;
+      try {
+        out = await tryRawStream(zAnnex, work, null, (m) => logs.push(m), () => {});
+      } catch (e) { logs.push(String(e)); }
+      check('纯 Annex-B（无 mdat）可裸流恢复', !!out, logs.slice(-2).join(' | '));
+      if (out) {
+        const info = summarize((await ffprobe(out)).raw);
+        check('前导零裸流恢复出可探测视频', !!info?.video, `dur=${info?.duration}`);
+      }
+      await rm(work, { recursive: true, force: true }).catch(() => {});
+      await rm(zAnnex, { force: true }).catch(() => {});
+      await rm(annex, { force: true }).catch(() => {});
+    }
+    for (const f of [zMp4]) await rm(f, { force: true }).catch(() => {});
+
+    // Diagnosis cache: unchanged file hits, explicit invalidation misses, and
+    // a changed file can never serve a stale verdict.
+    clearDiagnosisCache();
+    const cfile = join(DIR, '.cache_test.mp4');
+    await writeFile(cfile, raw);
+    const first = await cachedDiagnose(cfile);
+    const second = await cachedDiagnose(cfile);
+    check('首次诊断为未命中缓存', first.cached !== true);
+    check('未变化文件第二次命中诊断缓存', second.cached === true && second.verdict === first.verdict);
+    check('缓存 attach 了 age 信息', Number.isFinite(second.cacheAgeMs));
+    invalidateDiagnosis(cfile);
+    check('失效后重新诊断', (await cachedDiagnose(cfile)).cached !== true);
+    await writeFile(cfile, Buffer.concat([raw, Buffer.from([0])]));
+    check('文件内容变化后不使用旧缓存', (await cachedDiagnose(cfile)).cached !== true);
+    check('缓存容量受控', diagnosisCacheStats().entries <= diagnosisCacheStats().max);
+    await rm(cfile, { force: true }).catch(() => {});
+    clearDiagnosisCache();
   }
 
   console.log(`\n=== 结果： ${pass} 通过, ${fail} 失败 ===\n`);

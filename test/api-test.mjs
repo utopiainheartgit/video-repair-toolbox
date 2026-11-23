@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
-import { readFile, stat, readdir, writeFile, rm, mkdir } from 'node:fs/promises';
+import { readFile, stat, readdir, writeFile, rm, mkdir, copyFile, truncate, mkdtemp } from 'node:fs/promises';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { inspectBoxes } from '../lib/probe.mjs';
 import { makeSamples } from './samples.mjs';
 
 const BASE = 'http://127.0.0.1:8731';
@@ -155,7 +157,6 @@ const progEvts = re2.filter((e) => e.ev === 'progress');
 check('progress.total 与 start/done.total 一致', progEvts.length > 0 && progEvts.every((e) => e.d.total === 8), JSON.stringify(progEvts.map((e) => e.d)));
 
 console.log('\n=== 合并：计划接口 ===');
-const { copyFile } = await import('node:fs/promises');
 const ma = join(DIR, '.api_merge_a.mp4');
 const mb = join(DIR, '.api_merge_b.mp4');
 await copyFile(goodFile, ma);
@@ -322,6 +323,19 @@ const failFile = join(DIR, '.api_whitelist_fail.mp4');
 await writeFile(failFile, Buffer.from('not a video'));
 const sseFail = await sse('/api/jobs', { mode: 'repair', files: [failFile], deep: false });
 check('修复失败项进入删除白名单', sseFail.some((e) => e.ev === 'file-done' && e.d.action === 'failed'));
+
+// Repeat history must be visible BEFORE the next attempt, and an unchanged
+// file must hit the diagnosis cache instead of paying for another ffprobe.
+const sseFail2 = await sse('/api/jobs', { mode: 'repair', files: [failFile], deep: false });
+const priorDiag = sseFail2.find((e) => e.ev === 'diagnosis')?.d?.priorFailure;
+check('重复修复前返回历史失败提示', Number(priorDiag?.count) >= 1, JSON.stringify(priorDiag));
+check('历史提示带可展示的文案', /此前修复失败/.test(priorDiag?.hint || ''));
+const priorDone = sseFail2.find((e) => e.ev === 'file-done')?.d?.priorFailure;
+check('file-done 同样携带历史失败提示', Number(priorDone?.count) >= 1, JSON.stringify(priorDone));
+check('未变化文件命中诊断缓存', sseFail2.some((e) => e.ev === 'log' && /命中诊断缓存/.test(e.d.message || '')));
+const scanAgain = await (await fetch(BASE + '/api/scan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: failFile }) })).json();
+check('扫描结果也带历史失败提示', Number(scanAgain.files?.[0]?.priorFailure?.count) >= 1, JSON.stringify(scanAgain.files?.[0]?.priorFailure));
+
 // Running another repair must not evict the earlier failed path.
 await sse('/api/jobs', { mode: 'repair', files: [join(DIR, 'healthy.mp4')], deep: false });
 const delRes = await fetch(BASE + '/api/trash-failed', {
@@ -331,6 +345,25 @@ const delRes = await fetch(BASE + '/api/trash-failed', {
 const delData = await delRes.json();
 check('二次修复后旧失败项仍可删除', delData.trashed?.includes(failFile), JSON.stringify(delData));
 check('删除操作写入日志', (await readFile(join(import.meta.dirname, '..', 'logs', 'repair-history.jsonl'), 'utf8')).includes('"mode":"trash-failed"'));
+
+// A moov-missing clip with healthy siblings in its OWN folder must be repaired
+// without a manual reference. The old code only looked in the manually picked
+// reference's folder, so 13 of 14 such real failures had usable neighbours and
+// still failed.
+const refDir = await mkdtemp(join(tmpdir(), 'vrep-refpool-'));
+const goodClip = join(refDir, 'GOPRO01.mp4');
+const badClip = join(refDir, 'GOPRO02.mp4');
+await copyFile(join(DIR, 'healthy.mp4'), goodClip);
+await copyFile(join(DIR, 'moov_at_end.mp4'), badClip);
+const badBoxes = await inspectBoxes(badClip);
+const badMoov = badBoxes.boxes.find((b) => b.type === 'moov');
+await truncate(badClip, badMoov.start);
+const refEvts = await sse('/api/jobs', { mode: 'repair', files: [badClip], deep: false });
+check('同目录健康文件触发自动参考池', refEvts.some((e) => e.ev === 'log' && /自动参考.*同目录/.test(e.d.message || '')),
+  refEvts.filter((e) => e.ev === 'log').map((e) => e.d.message).join(' | ').slice(0, 300));
+check('无手动参考时同目录参考也能修复', refEvts.find((e) => e.ev === 'file-done')?.d?.action === 'repaired',
+  JSON.stringify(refEvts.find((e) => e.ev === 'file-done')?.d));
+await rm(refDir, { recursive: true, force: true }).catch(() => {});
 
 // Malformed file entries must not kill the SSE stream: a file-done + done must
 // still arrive so the client does not treat it as a dropped connection.
