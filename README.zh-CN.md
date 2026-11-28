@@ -33,7 +33,9 @@ MP4/MOV 文件损坏，通常是录制中断、存储卡非正常拔出或传输
 
 需要先安装 [Node.js](https://nodejs.org/)（20.11+）和 [ffmpeg](https://www.gyan.dev/ffmpeg/builds/)，并确保 `ffmpeg.exe` / `ffprobe.exe` 在 `PATH` 中；也可以直接放到 `vendor\ffmpeg\bin\` 下，脚本会自动使用。untrunc 是可选的：从 [anthwlock/untrunc 的 Releases](https://github.com/anthwlock/untrunc/releases/latest) 下载 Windows 版，命名为 `vendor\untrunc\untrunc.exe` 即可启用索引重建。
 
-Windows 下原生文件夹/文件选择器、保存对话框、资源管理器定位、回收站删除均可正常使用，界面文案会自动切换为「回收站」「在资源管理器中显示」。也可手动指定路径：
+Windows 下原生文件夹/文件选择器、保存对话框、资源管理器定位、回收站删除均可正常使用，界面文案会自动切换为「回收站」「在资源管理器中显示」。
+
+**回收站安全**：网络共享（UNC）、U 盘/可移动盘不支持回收站，直接删除会变成永久删除。工具在这类位置会**拒绝删除并保留源文件**，不会 falsely 报告已移入回收站；超过回收站容量上限的文件同样会被拒绝。只有确认文件确实进入回收站后才算删除成功。也可手动指定路径：
 
 ```bat
 set FFMPEG_BIN=C:\tools\ffmpeg\bin\ffmpeg.exe
@@ -121,12 +123,16 @@ lib/audio.mjs           音轨检查
 lib/bitstream.mjs       码流辅助
 lib/merge.mjs           片段探测、方案与合并
 lib/queue.mjs           产物校验与源文件清理
-lib/trash.mjs           移入废纸篓
+lib/trash.mjs           macOS 移入废纸篓
+lib/platform.mjs        平台接口分派（macOS / Windows）
+lib/platform-mac.mjs    macOS 原生选择器 / 定位
+lib/platform-win.mjs    Windows 原生选择器 / 回收站
 lib/joblog.mjs          作业日志
 public/                 Web 界面（HTML / CSS / JavaScript）
 test/                   API 与单元测试
 vendor/untrunc/         内置 untrunc 源码 / 构建
 启动视频修复.command      macOS 启动脚本
+启动视频修复.bat          Windows 启动脚本
 ```
 
 ## 测试

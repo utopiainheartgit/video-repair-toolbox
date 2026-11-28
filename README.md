@@ -31,7 +31,9 @@ Double-click `启动视频修复.command` ("Start Video Repair"). It checks the 
 
 Double-click `启动视频修复.bat`. It checks Node.js, ffmpeg and ffprobe, configures the environment, starts the local service and opens the browser. Install [Node.js](https://nodejs.org/) (20.11+) and [ffmpeg](https://www.gyan.dev/ffmpeg/builds/), then either put `ffmpeg.exe` / `ffprobe.exe` on `PATH` or drop them into `vendor\ffmpeg\bin\`. untrunc is optional: grab the Windows build from [anthwlock/untrunc releases](https://github.com/anthwlock/untrunc/releases/latest) and save it as `vendor\untrunc\untrunc.exe`.
 
-Native pickers, save dialogs, Explorer reveal and Recycle Bin deletion all work on Windows; UI wording switches to "Recycle Bin" / "Show in Explorer" automatically. Paths can also be overridden manually:
+Native pickers, save dialogs, Explorer reveal and Recycle Bin deletion all work on Windows; UI wording switches to "Recycle Bin" / "Show in Explorer" automatically.
+
+**Recycle Bin safety:** UNC/network shares and removable drives cannot use the Recycle Bin — deleting there would be permanent. On those locations the tool **refuses the delete and keeps the source file** instead of falsely reporting success. Files above the Recycle Bin quota are refused too, and a delete only counts as successful once the file is confirmed in the bin. Paths can also be overridden manually:
 
 ```bat
 set FFMPEG_BIN=C:\tools\ffmpeg\bin\ffmpeg.exe
@@ -119,12 +121,16 @@ lib/audio.mjs           audio stream inspection
 lib/bitstream.mjs       bitstream helpers
 lib/merge.mjs           probing, planning and merging clips
 lib/queue.mjs           output verification and source cleanup
-lib/trash.mjs           move to Trash
+lib/trash.mjs           macOS move to Trash
+lib/platform.mjs        platform dispatch (macOS / Windows)
+lib/platform-mac.mjs    macOS pickers / reveal
+lib/platform-win.mjs    Windows pickers / Recycle Bin
 lib/joblog.mjs          job log
 public/                 web UI (HTML, CSS, JavaScript)
 test/                   API and unit tests
 vendor/untrunc/         bundled untrunc sources/build
 启动视频修复.command      macOS launcher
+启动视频修复.bat          Windows launcher
 ```
 
 ## Tests

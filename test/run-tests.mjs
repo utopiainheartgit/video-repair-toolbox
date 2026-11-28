@@ -445,6 +445,12 @@ async function main() {
     check('删除走回收站而非永久删除',
       winPlat.SCRIPTS.trash.includes('SendToRecycleBin') && !winPlat.SCRIPTS.trash.includes('Remove-Item'));
     check('删除后验证源文件已消失', winPlat.SCRIPTS.trash.includes('Test-Path -LiteralPath'));
+    // P0: a permanent delete must never be reported as a successful recycle.
+    check('拒绝 UNC 网络路径', winPlat.SCRIPTS.trash.includes('__VT_REJECT_UNC__'));
+    check('拒绝非固定磁盘卷', winPlat.SCRIPTS.trash.includes('DriveType') && winPlat.SCRIPTS.trash.includes('__VT_REJECT_VOLUME__'));
+    check('拒绝超过回收站配额的大文件', winPlat.SCRIPTS.trash.includes('MaxCapacity') && winPlat.SCRIPTS.trash.includes('__VT_REJECT_QUOTA__'));
+    check('删除后核实确实进入回收站（比对数量）',
+      winPlat.SCRIPTS.trash.includes('NameSpace(10).Items().Count') && winPlat.SCRIPTS.trash.includes('__VT_NOT_IN_BIN__'));
     check('用户数据只从环境变量读取', scripts.every(([, s]) => /\$env:VTOOL_/.test(s)));
     check('脚本中不出现中文路径字面量', scripts.every(([, s]) => !/[一-龥]/.test(s)));
   }

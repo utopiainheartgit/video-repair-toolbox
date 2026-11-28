@@ -9,8 +9,8 @@ echo   视频工具箱 - 修复 / 合并 (Windows)
 echo ============================================
 echo.
 
-set "PORT=8731"
-if defined VT_PORT set "PORT=%VT_PORT%"
+rem PORT from the environment wins; default to 8731 only when unset.
+if not defined PORT set "PORT=8731"
 set "URL=http://127.0.0.1:%PORT%"
 
 where node >nul 2>&1
@@ -59,7 +59,8 @@ if defined UNTRUNC_BIN (
 )
 echo.
 
-netstat -ano | findstr /C:":%PORT% " | findstr /I "LISTENING" >nul
+rem Verify the port belongs to THIS app, not an unrelated listener.
+powershell -NoProfile -Command "try { $r = Invoke-RestMethod -Uri '%URL%/api/capabilities' -TimeoutSec 2; if ($r.pathMode) { exit 0 } } catch {}; exit 1" >nul 2>&1
 if not errorlevel 1 (
   echo 服务已在运行，直接打开网页。
   start "" "%URL%"
@@ -68,10 +69,26 @@ if not errorlevel 1 (
 )
 
 echo 启动本地服务（仅监听 127.0.0.1，不对外网开放）...
+rem Start the server FIRST and wait until it answers, so the browser never
+rem opens onto a "connection refused" page on a cold start.
+start "视频修复服务" /min cmd /c "node server.mjs"
+
+set /a VT_TRIES=0
+:waitloop
+set /a VT_TRIES+=1
+powershell -NoProfile -Command "try { $r = Invoke-RestMethod -Uri '%URL%/api/capabilities' -TimeoutSec 2; if ($r.pathMode) { exit 0 } } catch {}; exit 1" >nul 2>&1
+if not errorlevel 1 goto ready
+if %VT_TRIES% GEQ 40 goto failed
+ping -n 2 127.0.0.1 >nul 2>&1
+goto waitloop
+
+:ready
+echo [OK] 服务就绪，正在打开 %URL%
 start "" "%URL%"
-node server.mjs
-if errorlevel 1 (
-  echo.
-  echo [X] 服务启动失败，请检查上方错误信息。
-  pause
-)
+echo 关闭「视频修复服务」窗口即可停止服务。
+exit /b 0
+
+:failed
+echo [X] 服务启动超时，请检查上面的错误信息，或手动运行: node server.mjs
+pause
+exit /b 1

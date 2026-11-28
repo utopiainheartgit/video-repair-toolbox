@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 import { readFile, readdir, stat, mkdtemp, mkdir, rm, open } from 'node:fs/promises';
 import { join, extname, basename, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { tmpdir, homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { isVideoFile, diagnose, cachedDiagnose, invalidateDiagnosis, FFMPEG, FFPROBE, run } from './lib/probe.mjs';
@@ -128,16 +129,25 @@ function readBody(req, limit = 8 * 1024 * 1024) {
 // Reject cross-origin / non-JSON state-changing requests. This is a localhost
 // tool, but without these checks any web page could drive the delete endpoints
 // via DNS rebinding + a text/plain POST (which skips CORS preflight).
-function rejectCrossSite(req, res) {
+function rejectCrossSite(req, res, requireJson = true) {
   const host = String(req.headers.host || '');
-  if (host && host !== `${HOST}:${PORT}` && host !== HOST) {
+  // `localhost` is the same loopback interface as 127.0.0.1 and is what most
+  // people type. Rejecting it made every POST 403; accepting an EMPTY host is
+  // worse (that is exactly what a DNS-rebinding fetch can send), so require a
+  // recognised host rather than treating missing as allowed.
+  const allowed = new Set([
+    HOST, `${HOST}:${PORT}`, 'localhost', `localhost:${PORT}`,
+  ]);
+  if (!host || !allowed.has(host.toLowerCase())) {
     json(res, 403, { error: '拒绝跨站请求' });
     return false;
   }
-  const ct = String(req.headers['content-type'] || '');
-  if (!/^application\/json\b/i.test(ct)) {
-    json(res, 415, { error: '请使用 application/json' });
-    return false;
+  if (requireJson) {
+    const ct = String(req.headers['content-type'] || '');
+    if (!/^application\/json\b/i.test(ct)) {
+      json(res, 415, { error: '请使用 application/json' });
+      return false;
+    }
   }
   return true;
 }
@@ -184,8 +194,10 @@ function normalizePath(raw) {
   let s = raw.trim().replace(/;+$/, '');
   if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1).trim();
   if (s.startsWith('file://')) {
-    try { s = decodeURIComponent(new URL(s).pathname); }
-    catch { s = s.replace(/^file:\/\/(localhost)?/, ''); }
+    // fileURLToPath handles Windows drive letters correctly: `pathname` alone
+    // yields /C:/Users/... which resolve() turns into a broken \C:\Users path.
+    try { s = fileURLToPath(s); }
+    catch { s = s.replace(/^file:\/\/(localhost)?/, '').replace(/^\/([A-Za-z]:)/, '$1'); }
   }
   if (!s) return '';
   return resolve(s === '~' ? homedir() : s.startsWith('~/') ? join(homedir(), s.slice(2)) : s);
@@ -211,7 +223,7 @@ async function scanDir(root, { maxFiles = 20000 } = {}) {
         const s = await stat(p).catch(() => null);
         if (s) out.push({
           path: p, name: e.name, size: s.size,
-          rel: p.slice(root.length).replace(/^\//, ''),
+          rel: p.slice(root.length).replace(/^[\\/]/, ''),
           priorFailure: priorFailureFor(p),
         });
       }
@@ -264,7 +276,11 @@ async function handleApi(req, res, url) {
   // Every state-changing endpoint consumes a JSON body and may touch local
   // files (including the trash). Require a same-origin JSON POST so a random
   // web page cannot drive them via DNS rebinding / simple text/plain requests.
-  if (req.method === 'POST' && !rejectCrossSite(req, res)) return;
+  // Every state-changing method needs the same-origin check. Only POST carries
+  // a JSON body, so the Content-Type requirement applies to POST alone — but
+  // DELETE (staged-file cleanup) must not be left open to DNS rebinding.
+  if ((req.method === 'POST' || req.method === 'DELETE' || req.method === 'PUT')
+      && !rejectCrossSite(req, res, req.method === 'POST')) return;
 
   if (p === '/api/capabilities' && req.method === 'GET') {
     const untrunc = await findUntrunc();
@@ -378,7 +394,8 @@ async function handleApi(req, res, url) {
     const ctrl = new AbortController();
     res.on('close', () => { aborted = true; ctrl.abort(); });
     const refOk = reference && await stat(reference).catch(() => null);
-    const base = Math.max(0, Math.floor(Number(resumeFrom) || 0));
+    const baseNum = Number(resumeFrom);
+    const base = Number.isFinite(baseNum) ? Math.max(0, Math.floor(baseNum)) : 0;
     send('start', { total: base + files.length, mode, deep, untrunc: await findUntrunc(), reference: refOk ? reference : null });
 
     let done = base, repaired = 0, skipped = 0, failed = 0;
@@ -391,6 +408,8 @@ async function handleApi(req, res, url) {
       if (typeof path !== 'string' || !path) {
         failed++;
         send('file-done', { index: done, path: String(path ?? ''), name: '无效路径', verdict: 'error', action: 'failed', reasons: ['无效的文件路径'] });
+        done++;
+        send('progress', { done, total: base + files.length, repaired, skipped, failed });
         continue;
       }
       const name = basename(path);
@@ -850,9 +869,12 @@ async function handleApi(req, res, url) {
         });
         continue;
       }
-      const r = await trashFile(raw);
+      // Delete the NORMALISED absolute path, not the raw string: the whitelist
+      // was matched on the normalised form, so acting on a different form
+      // (file:// URL, relative path) could hit an unintended target.
+      const r = await trashFile(key);
       if (r?.ok !== false) {
-        trashed.push(raw);
+        trashed.push(key);
         failedPaths.delete(key);
       } else {
         errors.push({ path: raw, reason: r?.reason || '移入废纸篓失败' });
@@ -871,7 +893,9 @@ async function handleApi(req, res, url) {
 }
 
 async function serveStatic(req, res, url) {
-  let rel = decodeURIComponent(url.pathname);
+  let rel;
+  try { rel = decodeURIComponent(url.pathname); }
+  catch { return json(res, 400, { error: '路径编码非法' }); }
   if (rel === '/') rel = '/index.html';
   const file = resolve(join(PUBLIC, rel));
   if (!file.startsWith(PUBLIC + sep) && file !== join(PUBLIC, 'index.html')) return json(res, 403, { error: 'forbidden' });

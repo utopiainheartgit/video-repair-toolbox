@@ -2013,7 +2013,11 @@ function mUpdateMergePaste() {
   const c = $('mPasteCount');
   c.textContent = n ? `${n} 个路径` : '';
   c.classList.toggle('on', n > 0);
-  $('mPathGo').disabled = !n || mstate.running;
+  // Intake stays live while running (see mSetRunning): pasting a path during
+  // a merge must be able to append a new task. Gating on mstate.running here
+  // made the button grey out as soon as the user typed mid-run, contradicting
+  // both the UI hint and the pre-filled-path behaviour.
+  $('mPathGo').disabled = !n;
   $('mPathGo').textContent = n > 1 ? `载入 ${n} 个` : '载入';
   const ta = $('mPathInput');
   ta.style.height = 'auto';

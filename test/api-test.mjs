@@ -288,6 +288,40 @@ const badHostStatus = await new Promise((resolve) => {
 });
 check('跨站 Host 被拒绝', badHostStatus === 403, `HTTP ${badHostStatus}`);
 
+// localhost is the same loopback interface and must work — an earlier audit
+// found every POST returned 403 when the UI was opened via localhost.
+const localhostStatus = await new Promise((resolve) => {
+  const req = httpRequest({
+    host: '127.0.0.1', port: 8731, path: '/api/scan', method: 'POST',
+    headers: { 'Content-Type': 'application/json', Host: 'localhost:8731', 'Content-Length': 2 },
+  }, (res) => { res.resume(); resolve(res.statusCode); });
+  req.on('error', () => resolve(0));
+  req.end('{}');
+});
+check('localhost Host 被接受', localhostStatus === 400, `HTTP ${localhostStatus}`);
+// A missing Host must be rejected, not treated as "same origin".
+const noHostStatus = await new Promise((resolve) => {
+  const req = httpRequest({
+    host: '127.0.0.1', port: 8731, path: '/api/scan', method: 'POST',
+    headers: { 'Content-Type': 'application/json', Host: '', 'Content-Length': 2 },
+  }, (res) => { res.resume(); resolve(res.statusCode); });
+  req.on('error', () => resolve(0));
+  req.end('{}');
+});
+// Node's own HTTP parser rejects an empty Host with 400 before the request
+// reaches the app; either 400 (parser) or 403 (app guard) means "rejected".
+check('空 Host 被拒绝', noHostStatus === 403 || noHostStatus === 400, `HTTP ${noHostStatus}`);
+// DELETE must carry the same-origin guard even though it has no JSON body.
+const badHostDelete = await new Promise((resolve) => {
+  const req = httpRequest({
+    host: '127.0.0.1', port: 8731, path: '/api/staged/nope', method: 'DELETE',
+    headers: { Host: 'evil.example' },
+  }, (res) => { res.resume(); resolve(res.statusCode); });
+  req.on('error', () => resolve(0));
+  req.end();
+});
+check('DELETE 跨站 Host 被拒绝', badHostDelete === 403, `HTTP ${badHostDelete}`);
+
 // The native folder picker POST has no payload, but it still has to carry the
 // JSON header. Guard BOTH sides of that contract: a bodyless request must be
 // rejected, and every frontend call site must send the header. Without the
